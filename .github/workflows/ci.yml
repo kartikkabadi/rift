@@ -88,6 +88,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes ${{ matrix.packages }}
 
+      # The azure kernel used by GitHub runners ships f2fs in a separate
+      # modules package, not in the base kernel image.
+      - name: Install f2fs kernel module
+        if: matrix.filesystem == 'f2fs'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes "linux-modules-extra-$(uname -r)"
+          sudo modprobe f2fs
+
       - name: Prepare filesystem and run tests
         run: |
           bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}" -- \
