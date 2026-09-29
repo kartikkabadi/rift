@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { createRequire } from "node:module"
 
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
@@ -13,7 +14,13 @@ const musl = platform === "linux" && report?.header?.glibcVersionRuntime === und
 const flavor = musl ? "linux-musl" : platform
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const directory = path.join(root, "prebuilds", `${flavor}-${arch}`)
+// Prefer the installed per-platform package; fall back to the bundled
+// prebuilds shipped inside the launcher package itself.
+const require = createRequire(import.meta.url)
+let directory = path.join(root, "prebuilds", `${flavor}-${arch}`)
+try {
+  directory = path.dirname(require.resolve(`rift-snapshot-${flavor}-${arch}/package.json`))
+} catch {}
 const libraryPath = path.join(
   directory,
   platform === "windows" ? "rift_ffi.dll" : platform === "darwin" ? "librift_ffi.dylib" : "librift_ffi.so",
@@ -112,6 +119,19 @@ export function ancestors({ of = process.cwd(), database } = {}) {
 
 export function doctor({ of = process.cwd(), database } = {}) {
   return call({ command: "doctor", of, database })
+}
+
+
+export function diff({ at = process.cwd(), database } = {}) {
+  return call({ command: "diff", at, database })
+}
+
+export function land({ at = process.cwd(), database } = {}) {
+  return call({ command: "land", at, database })
+}
+
+export function sync({ at = process.cwd(), database } = {}) {
+  return call({ command: "sync", at, database })
 }
 
 export function gc({ database } = {}) {

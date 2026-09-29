@@ -81,13 +81,20 @@ pub(crate) fn copy_directory_portable(from: &Path, to: &Path, mode: CopyMode) ->
             let key = link_key(&metadata, source);
             if let Some(existing) = key.and_then(|key| hard_links.get(&key)) {
                 fs::hard_link(existing, &destination)?;
+                copy_metadata(source, &destination, MetadataTarget::FileOrDirectory)?;
+            } else if is_git_object(from, source) && fs::hard_link(source, &destination).is_ok() {
+                // Git objects are immutable, so a regular copy still shares
+                // the object store's inodes instead of duplicating them —
+                // on slow filesystems .git dominates the copy. When the two
+                // trees sit on different filesystems the link fails and the
+                // file is copied normally.
             } else {
                 fs::copy(source, &destination)?;
                 if let Some(key) = key {
                     hard_links.insert(key, destination.clone());
                 }
+                copy_metadata(source, &destination, MetadataTarget::FileOrDirectory)?;
             }
-            copy_metadata(source, &destination, MetadataTarget::FileOrDirectory)?;
         } else if file_type.is_symlink() {
             create_symlink(source, &destination)?;
             copy_metadata(source, &destination, MetadataTarget::Symlink)?;
@@ -99,6 +106,14 @@ pub(crate) fn copy_directory_portable(from: &Path, to: &Path, mode: CopyMode) ->
         copy_metadata(&source, &destination, MetadataTarget::FileOrDirectory)?;
     }
     copy_metadata(from, to, MetadataTarget::FileOrDirectory)
+}
+
+/// Files under `<from>/.git/objects` are Git's content-addressed object
+/// store: immutable once written, so they can be hard-linked into a copy.
+fn is_git_object(from: &Path, source: &Path) -> bool {
+    source
+        .strip_prefix(from)
+        .is_ok_and(|relative| relative.starts_with(".git/objects"))
 }
 
 /// A stable identifier for deduplicating hard links within one copy.

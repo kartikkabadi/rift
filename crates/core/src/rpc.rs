@@ -1,5 +1,6 @@
 use crate::{
     CopyMode, CowMode, Create, CreateOptions, Error, HookMode, Manager, Probe, RemoveOptions,
+    TreeDiff,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -48,6 +49,15 @@ enum Command {
     Ancestors {
         of: PathBuf,
     },
+    Diff {
+        at: PathBuf,
+    },
+    Land {
+        at: PathBuf,
+    },
+    Sync {
+        at: PathBuf,
+    },
     Gc,
 }
 
@@ -58,6 +68,7 @@ enum Value {
     Path(PathBuf),
     Paths(Vec<PathBuf>),
     Report(Probe),
+    Diff(TreeDiff),
 }
 
 #[derive(Serialize)]
@@ -117,6 +128,7 @@ impl From<Error> for Failure {
             Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
             Error::CowImageSetup(_) => ("cow_image_setup", None),
+            Error::NoParent { path, .. } => ("no_parent", Some(path.clone())),
         };
         let (hook, committed) = match &error {
             Error::HookFailed { hook, .. } => (
@@ -241,6 +253,9 @@ fn execute(input: &str) -> Result<Value, Failure> {
             .ancestors(of)
             .map(Value::Paths)
             .map_err(Failure::from),
+        Command::Diff { at } => manager.diff(at).map(Value::Diff).map_err(Failure::from),
+        Command::Land { at } => manager.land(at).map(Value::Diff).map_err(Failure::from),
+        Command::Sync { at } => manager.sync(at).map(Value::Diff).map_err(Failure::from),
         Command::Gc => manager.gc().map(Value::Paths).map_err(Failure::from),
     }
 }

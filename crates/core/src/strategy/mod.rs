@@ -111,6 +111,7 @@ impl Strategy for TestStrategy {
     fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, _cow: CowMode) -> Result<()> {
         create_destination(to)?;
         let filter = CopyFilter;
+        let mut directories = Vec::new();
         for entry in walkdir::WalkDir::new(from)
             .min_depth(1)
             .follow_links(false)
@@ -132,13 +133,26 @@ impl Strategy for TestStrategy {
             );
             if entry.file_type().is_dir() {
                 fs::create_dir(&destination)?;
+                directories.push((entry.path().to_path_buf(), destination));
                 continue;
             }
             if entry.file_type().is_symlink() {
                 copy_symlink(entry.path(), &destination)?;
                 continue;
             }
-            fs::copy(entry.path(), destination)?;
+            fs::copy(entry.path(), &destination)?;
+            portable::copy_metadata(
+                entry.path(),
+                &destination,
+                portable::MetadataTarget::FileOrDirectory,
+            )?;
+        }
+        for (source, destination) in directories.into_iter().rev() {
+            portable::copy_metadata(
+                &source,
+                &destination,
+                portable::MetadataTarget::FileOrDirectory,
+            )?;
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 mod config;
 pub mod cow_image;
+mod diff;
 mod filter;
 mod git;
 mod hook;
@@ -79,7 +80,14 @@ pub enum Error {
     },
     #[error("copy-on-write image setup failed: {0}")]
     CowImageSetup(String),
+    #[error("workspace has no parent to {operation} with: {path}")]
+    NoParent {
+        path: PathBuf,
+        operation: &'static str,
+    },
 }
+
+pub use diff::{DiffEntry, DiffKind, TreeDiff};
 
 pub struct Create {
     pub from: PathBuf,
@@ -683,6 +691,49 @@ impl Manager {
 
     pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(self.workspace_at(at)?.path)
+    }
+
+    /// The file-level changes inside the workspace at `at` relative to the
+    /// parent workspace it was copied from.
+    pub fn diff(&self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "compare")?;
+        diff::diff_trees(&parent.path, &record.path)
+    }
+
+    /// Applies the workspace's changes back into its parent workspace,
+    /// making the parent's files match the rift's. A rift has no three-way
+    /// merge: each differing path takes the rift's version, including the
+    /// `.git` directory (so commits made inside the rift land too).
+    pub fn land(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "land")?;
+        let diff = diff::diff_trees(&parent.path, &record.path)?;
+        diff::apply_diff(&diff)?;
+        Ok(diff)
+    }
+
+    /// The reverse of `land`: refreshes the rift from its parent workspace,
+    /// making the rift's files match the parent's current state.
+    pub fn sync(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "sync")?;
+        let diff = diff::diff_trees(&record.path, &parent.path)?;
+        diff::apply_diff(&diff)?;
+        Ok(diff)
+    }
+
+    fn parent(&self, record: &Record, operation: &'static str) -> Result<Record> {
+        let id = record.parent_id.clone().ok_or_else(|| Error::NoParent {
+            path: record.path.clone(),
+            operation,
+        })?;
+        self.registry
+            .record_id(&id)?
+            .ok_or_else(|| Error::NotManaged(record.path.clone()))
     }
 
     /// Reports which copy mechanism `create` would use for a path that exists

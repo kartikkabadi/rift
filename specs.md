@@ -139,6 +139,50 @@ ancestors(input: {
 
 `ancestors` returns the managed ancestry of `of`, ordered from its immediate parent to the root workspace.
 
+### `diff`
+
+```ts
+diff(input: {
+  at: AbsolutePath
+}): { from: AbsolutePath; to: AbsolutePath; entries: { path: RelativePath; kind: "added" | "removed" | "changed" }[] }
+```
+
+`diff` reports the file-level changes inside `at` relative to the parent workspace it was copied from. Entries are
+compared by kind, size, modification time, mode, and symlink target — a file that was copied with its metadata intact
+counts as unchanged. Each workspace's own `.rift` marker is bookkeeping and never appears in the result.
+
+- `at` must be a managed workspace with a recorded parent; the root workspace fails with a no-parent error.
+- File content is not hashed: two entries with equal fingerprints are treated as identical, which is the same
+  guarantee `create` relies on when it preserves metadata.
+
+### `land`
+
+```ts
+land(input: {
+  at: AbsolutePath
+}): TreeDiff
+```
+
+`land` applies the rift's changes back into its parent workspace and returns the diff it applied. Added and changed
+entries are copied into the parent with their metadata; removed entries are deleted from the parent; symlinks are
+recreated. The `.git` directory is synchronized like any other, so commits made inside the rift land along with the
+working tree.
+
+- `land` is a file-level replay, not a three-way merge: where the parent's copy of a path differs, the rift's version
+  wins. Files only the parent touched are untouched.
+- The rift remains a registered, usable workspace afterward; `remove` discards it when finished.
+
+### `sync`
+
+```ts
+sync(input: {
+  at: AbsolutePath
+}): TreeDiff
+```
+
+`sync` is `land` in the opposite direction: the parent's current state is applied onto the rift, so a rift created
+before the source moved on picks up the new files, edits, and deletions.
+
 ### `gc`
 
 ```ts
@@ -219,6 +263,7 @@ Copying is implemented behind a `Strategy` interface so platform-specific copy-o
 - The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning for exact copies and per-entry cloning for filtered copies; `clonefile` requires both paths to share one APFS volume.
 - The `WindowsStrategy` production strategy uses ReFS block cloning (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) when source and destination share an ReFS volume.
 - Every strategy falls back to `PortableStrategy`, an ordinary file-by-file copy that preserves symlinks, permissions, timestamps, and hard links on a best-effort basis, when no instant-copy backend applies to the requested copy. The `--cow-only` flag (API `cowOnly`) disables that fallback and makes `init`/`create` fail instead.
+- `PortableStrategy` hard-links files under `.git/objects` instead of copying them whenever source and destination share a filesystem. Git objects are immutable and content-addressed, so the rift shares the object store's inodes and skips what is usually the bulk of a regular copy; cross-filesystem copies fall back to ordinary file copies automatically.
 - Each strategy can `probe` a path for the backend a copy would use; `rift doctor` reports the probe result.
 
 ## Packaging
@@ -233,6 +278,8 @@ The project ships four interfaces backed by the same implementation and metadata
 The CLI and language bindings should remain thin and expose the same API semantics as the native library.
 
 The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. Linux targets include glibc and static musl builds; the CLI shim selects the musl build when it detects a musl libc (for example on Alpine). It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
+
+Each target also publishes as its own `rift-snapshot-<platform>-<arch>` package restricted by `os`/`cpu`, listed as an optional dependency of the launcher. npm then downloads only the matching platform's binary; the launcher's CLI shim and bindings resolve the platform package first and fall back to the bundled `prebuilds/` copy.
 
 For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted. Workspace operations locate their root by searching upward for its `.rift` marker. The CLI applies similar selection before calling exact-path core `init`, unless `rift init --here` is explicitly requested.
 

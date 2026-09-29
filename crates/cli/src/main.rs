@@ -179,6 +179,27 @@ enum Command {
     Ancestors {
         of: Option<PathBuf>,
     },
+    /// Show which files changed inside this rift compared to the workspace
+    /// it was copied from.
+    Diff {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply this rift's changes back into the workspace it was copied from,
+    /// then keep working in the rift or `rift remove` it.
+    Land {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull the source workspace's latest files into this rift (the reverse
+    /// of `rift land`).
+    Sync {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Gc,
 }
 
@@ -203,6 +224,9 @@ fn error_message(error: &rift::Error) -> String {
         }
         rift::Error::MissingMarker(_) => {
             "this workspace is missing its `.rift` marker; run `rift init` to restore it".into()
+        }
+        rift::Error::NoParent { .. } => {
+            "this is the root workspace; it has no source to diff, land, or sync against".into()
         }
         _ => error.to_string(),
     }
@@ -467,12 +491,61 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Command::Diff { at, json } => {
+            let diff = manager.diff(at.unwrap_or(std::env::current_dir()?))?;
+            print_diff(&diff, json);
+            Ok(())
+        }
+        Command::Land { at, json } => {
+            let diff = manager.land(at.unwrap_or(std::env::current_dir()?))?;
+            print_diff(&diff, json);
+            eprintln!(
+                "landed {} change(s) into {}",
+                diff.entries.len(),
+                diff.from.display()
+            );
+            Ok(())
+        }
+        Command::Sync { at, json } => {
+            let diff = manager.sync(at.unwrap_or(std::env::current_dir()?))?;
+            print_diff(&diff, json);
+            eprintln!(
+                "synced {} change(s) from {}",
+                diff.entries.len(),
+                diff.to.display()
+            );
+            Ok(())
+        }
         Command::Gc => {
             for path in manager.gc()? {
                 println!("{}", path.display());
             }
             Ok(())
         }
+    }
+}
+
+/// Prints a diff the way `git status --short` does: A added, M modified,
+/// D deleted.
+fn print_diff(diff: &rift::TreeDiff, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(diff).unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    if diff.is_clean() {
+        println!("no changes");
+        return;
+    }
+    for entry in &diff.entries {
+        let marker = match entry.kind {
+            rift::DiffKind::Added => "A",
+            rift::DiffKind::Changed => "M",
+            rift::DiffKind::Removed => "D",
+        };
+        println!("{marker} {}", entry.path.display());
     }
 }
 
@@ -709,5 +782,21 @@ mod tests {
             powershell_shell_quote("/tmp/it's rift"),
             "'/tmp/it''s rift'"
         );
+    }
+}
+
+#[cfg(test)]
+mod diff_land_sync_tests {
+    use super::*;
+
+    #[test]
+    fn diff_land_and_sync_parse_flags() {
+        let diff = Cli::try_parse_from(["rift", "diff", "--json"]).unwrap();
+        let land = Cli::try_parse_from(["rift", "land", "/tmp/x"]).unwrap();
+        let sync = Cli::try_parse_from(["rift", "sync", "--json"]).unwrap();
+
+        assert!(matches!(diff.command, Command::Diff { json: true, .. }));
+        assert!(matches!(land.command, Command::Land { at: Some(_), .. }));
+        assert!(matches!(sync.command, Command::Sync { json: true, .. }));
     }
 }

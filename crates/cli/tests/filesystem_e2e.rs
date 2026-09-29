@@ -104,6 +104,41 @@ fn supported_filesystem_cli_round_trip() {
     assert_eq!(fallback, external_parent.join("external"));
     assert_workspace_copy(&fallback);
 
+    // diff/land/sync round-trip through the CLI.
+    fs::write(child.join("made-in-rift.txt"), "from rift").unwrap();
+    let diff = fixture.success(&child, ["diff"]);
+    assert!(diff.stdout.contains("A made-in-rift.txt"));
+    assert!(
+        fixture
+            .success(&child, [os("diff"), os("--json")])
+            .stdout
+            .contains("\"kind\":\"added\"")
+    );
+    let landed = fixture.success(&child, ["land"]);
+    assert!(landed.stderr.contains("landed 1 change"));
+    assert_eq!(
+        fs::read_to_string(source.join("made-in-rift.txt")).unwrap(),
+        "from rift"
+    );
+    assert!(
+        fixture
+            .success(&child, ["diff"])
+            .stdout
+            .contains("no changes")
+    );
+
+    fs::write(source.join("made-in-source.txt"), "from source").unwrap();
+    let synced = fixture.success(&child, ["sync"]);
+    assert!(synced.stderr.contains("synced 1 change"));
+    assert_eq!(
+        fs::read_to_string(child.join("made-in-source.txt")).unwrap(),
+        "from source"
+    );
+
+    // The root workspace has no parent to diff, land, or sync against.
+    let orphan = fixture.failure(&source, ["diff"]);
+    assert!(orphan.stderr.contains("no source to diff"));
+
     let remove = fixture.success(&source, [os("remove"), os(child.as_os_str())]);
     assert!(remove.stdout.is_empty());
     assert!(!child.exists());

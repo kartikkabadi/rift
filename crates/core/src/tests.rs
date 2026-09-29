@@ -1314,3 +1314,147 @@ fn run(path: &Path, args: &[&str]) {
             .success()
     );
 }
+
+fn diff_kinds(diff: &TreeDiff) -> Vec<(String, DiffKind)> {
+    diff.entries
+        .iter()
+        .map(|entry| (entry.path.to_string_lossy().replace('\\', "/"), entry.kind))
+        .collect()
+}
+
+#[test]
+fn diff_reports_added_changed_and_removed_files() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let diff = manager.diff(&child).unwrap();
+
+    let kinds = diff_kinds(&diff);
+    assert!(kinds.contains(&("new.txt".into(), DiffKind::Added)));
+    assert!(kinds.contains(&("file.txt".into(), DiffKind::Changed)));
+    assert!(!kinds.iter().any(|(path, _)| path == ".rift"));
+}
+
+#[test]
+fn diff_reports_removals_and_directory_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/deep.txt"), "deep").unwrap();
+    fs::write(source.join("gone.txt"), "bye").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::remove_dir_all(child.join("nested")).unwrap();
+    fs::remove_file(child.join("gone.txt")).unwrap();
+
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+    assert!(kinds.contains(&("nested".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("nested/deep.txt".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("gone.txt".into(), DiffKind::Removed)));
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_reports_symlink_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    std::os::unix::fs::symlink("file.txt", source.join("link.txt")).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::remove_file(child.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("other.txt", child.join("link.txt")).unwrap();
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+
+    assert!(kinds.contains(&("link.txt".into(), DiffKind::Changed)));
+
+    manager.land(&child).unwrap();
+    assert_eq!(
+        fs::read_link(source.join("link.txt")).unwrap(),
+        Path::new("other.txt")
+    );
+}
+
+#[test]
+fn land_applies_the_rifts_changes_to_the_source() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::remove_file(child.join("old.txt")).unwrap();
+    let diff = manager.land(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "edited"
+    );
+    assert_eq!(fs::read_to_string(source.join("new.txt")).unwrap(), "added");
+    assert!(!source.join("old.txt").exists());
+    assert!(manager.diff(&child).unwrap().is_clean());
+    // The rift keeps working after landing.
+    assert_eq!(diff.entries.len(), 3);
+    assert!(marker::read(&child).unwrap().is_some());
+}
+
+#[test]
+fn sync_pulls_the_sources_changes_into_the_rift() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(source.join("file.txt"), "upstream").unwrap();
+    fs::write(source.join("later.txt"), "new upstream file").unwrap();
+    let diff = manager.sync(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(child.join("file.txt")).unwrap(),
+        "upstream"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("later.txt")).unwrap(),
+        "new upstream file"
+    );
+    assert!(!diff.entries.is_empty());
+}
+
+#[test]
+fn root_workspace_has_no_parent_for_diff_land_or_sync() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    assert!(matches!(manager.diff(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.land(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.sync(&source), Err(Error::NoParent { .. })));
+}

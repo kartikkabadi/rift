@@ -53,6 +53,7 @@ export type RiftErrorCode =
   | "inside_source"
   | "invalid_config"
   | "hook_failed"
+  | "no_parent"
   | "invalid_request"
   | "panic"
   | "serialization"
@@ -89,3 +90,25 @@ export function remove(options?: RemoveOptions): void
 export function list(options?: OfOptions): string[]
 export function ancestors(options?: OfOptions): string[]
 export function gc(options?: Options): string[]
+
+export type DiffKind = "added" | "removed" | "changed"
+
+export interface DiffEntry {
+  /** Path relative to the compared roots. */
+  path: string
+  kind: DiffKind
+}
+
+/** The file-level changes that turn `from` into `to`. */
+export interface TreeDiff {
+  from: string
+  to: string
+  entries: DiffEntry[]
+}
+
+/** The changes inside the workspace relative to the workspace it was copied from. */
+export function diff(options?: AtOptions): TreeDiff
+/** Apply the workspace's changes back into the workspace it was copied from. */
+export function land(options?: AtOptions): TreeDiff
+/** Pull the source workspace's latest files into this workspace (the reverse of `land`). */
+export function sync(options?: AtOptions): TreeDiff

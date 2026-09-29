@@ -121,6 +121,19 @@ jobs:
           path: npm/rift-snapshot/prebuilds/${{ matrix.platform }}
           if-no-files-found: error
 
+      - name: Populate platform package
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./npm/rift-snapshot/package.json').version")
+          node scripts/prepare-npm-platform-package.mjs "${{ matrix.platform }}" "$VERSION" "platform/${{ matrix.platform }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "target/${{ matrix.target }}/release/${{ matrix.library }}"
+
+      - name: Upload platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-platform-${{ matrix.platform }}
+          path: platform/${{ matrix.platform }}
+          if-no-files-found: error
+
   publish:
     name: Publish npm packages
     needs: build
@@ -186,8 +199,22 @@ jobs:
           name: npm-prebuild-windows-arm64
           path: npm/rift-snapshot/prebuilds/windows-arm64
 
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-platform-*
+          path: platform
+
       - name: Restore executable permissions
-        run: chmod +x npm/rift-snapshot/prebuilds/linux-x64/* npm/rift-snapshot/prebuilds/linux-arm64/* npm/rift-snapshot/prebuilds/linux-musl-x64/* npm/rift-snapshot/prebuilds/linux-musl-arm64/* npm/rift-snapshot/prebuilds/darwin-x64/* npm/rift-snapshot/prebuilds/darwin-arm64/*
+        run: |
+          chmod +x npm/rift-snapshot/prebuilds/linux-x64/* npm/rift-snapshot/prebuilds/linux-arm64/* npm/rift-snapshot/prebuilds/linux-musl-x64/* npm/rift-snapshot/prebuilds/linux-musl-arm64/* npm/rift-snapshot/prebuilds/darwin-x64/* npm/rift-snapshot/prebuilds/darwin-arm64/*
+          chmod +x platform/npm-platform-*/rift platform/npm-platform-*/librift_ffi.so || true
+
+      - name: Publish platform packages
+        run: |
+          for dir in platform/npm-platform-*/; do
+            npm publish "$dir" --provenance
+          done
 
       - name: Publish launcher package
         run: npm publish ./npm/rift-snapshot --provenance

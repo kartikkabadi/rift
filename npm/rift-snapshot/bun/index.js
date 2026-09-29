@@ -1,6 +1,9 @@
 import { CString, dlopen, ptr } from "bun:ffi"
 import fs from "node:fs"
 import os from "node:os"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { createRequire } from "node:module"
 
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
@@ -11,25 +14,22 @@ const musl =
   platform === "linux" &&
   (report ? report.header?.glibcVersionRuntime === undefined : fs.existsSync("/etc/alpine-release"))
 
-let libraryPath
-if (platform === "linux" && arch === "x64" && musl) {
-  libraryPath = (await import("../prebuilds/linux-musl-x64/librift_ffi.so", { with: { type: "file" } })).default
-} else if (platform === "linux" && arch === "x64") {
-  libraryPath = (await import("../prebuilds/linux-x64/librift_ffi.so", { with: { type: "file" } })).default
-} else if (platform === "linux" && arch === "arm64" && musl) {
-  libraryPath = (await import("../prebuilds/linux-musl-arm64/librift_ffi.so", { with: { type: "file" } })).default
-} else if (platform === "linux" && arch === "arm64") {
-  libraryPath = (await import("../prebuilds/linux-arm64/librift_ffi.so", { with: { type: "file" } })).default
-} else if (platform === "darwin" && arch === "x64") {
-  libraryPath = (await import("../prebuilds/darwin-x64/librift_ffi.dylib", { with: { type: "file" } })).default
-} else if (platform === "darwin" && arch === "arm64") {
-  libraryPath = (await import("../prebuilds/darwin-arm64/librift_ffi.dylib", { with: { type: "file" } })).default
-} else if (platform === "windows" && arch === "x64") {
-  libraryPath = (await import("../prebuilds/windows-x64/rift_ffi.dll", { with: { type: "file" } })).default
-} else if (platform === "windows" && arch === "arm64") {
-  libraryPath = (await import("../prebuilds/windows-arm64/rift_ffi.dll", { with: { type: "file" } })).default
-} else {
-  throw new Error(`Unsupported Rift platform: ${platform}-${arch}`)
+const flavor = musl ? "linux-musl" : platform
+
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+// Prefer the installed per-platform package; fall back to the bundled
+// prebuilds shipped inside the launcher package itself.
+const require = createRequire(import.meta.url)
+let directory = path.join(root, "prebuilds", `${flavor}-${arch}`)
+try {
+  directory = path.dirname(require.resolve(`rift-snapshot-${flavor}-${arch}/package.json`))
+} catch {}
+const libraryPath = path.join(
+  directory,
+  platform === "windows" ? "rift_ffi.dll" : platform === "darwin" ? "librift_ffi.dylib" : "librift_ffi.so",
+)
+if (!fs.existsSync(libraryPath)) {
+  throw new Error(`Unable to locate the Rift native library for ${flavor}-${arch}. Reinstall rift-snapshot.`)
 }
 
 const { symbols } = dlopen(libraryPath, {
@@ -86,6 +86,19 @@ export function ancestors({ of = process.cwd(), database } = {}) {
 
 export function doctor({ of = process.cwd(), database } = {}) {
   return call({ command: "doctor", of, database })
+}
+
+
+export function diff({ at = process.cwd(), database } = {}) {
+  return call({ command: "diff", at, database })
+}
+
+export function land({ at = process.cwd(), database } = {}) {
+  return call({ command: "land", at, database })
+}
+
+export function sync({ at = process.cwd(), database } = {}) {
+  return call({ command: "sync", at, database })
 }
 
 export function gc({ database } = {}) {

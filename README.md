@@ -146,6 +146,21 @@ rift ancestors
 
 `list` prints direct child workspaces. `ancestors` prints parent workspaces, nearest first.
 
+### `rift diff`, `rift land`, and `rift sync`
+
+```bash
+rift diff                # what changed inside this rift vs its source
+rift land                # apply this rift's changes back into the source
+rift sync                # pull the source's latest files into this rift
+rift diff --json         # machine-readable output for agents
+```
+
+`diff` lists added, modified, and deleted files (`A`/`M`/`D`, like `git status --short`). `land` replays those changes
+into the workspace the rift was copied from — file contents, deletes, symlinks, and the `.git` directory itself, so
+commits made inside the rift land too. `sync` is the same operation in reverse: the rift picks up the source's
+current state. These are file-level copies, not merges — where both sides changed a file, the side being updated
+takes the other's version. Run `rift remove` after landing to discard the rift.
+
 ### `rift doctor`
 
 ```bash
@@ -201,11 +216,12 @@ until `rift gc` runs.
 The package selects a Bun or Node binding through conditional exports.
 
 ```ts
-import { create, doctor, list, remove, gc } from "rift-snapshot";
+import { create, diff, doctor, land, list, remove, gc } from "rift-snapshot";
 
 const workspace = create({ from: process.cwd(), name: "schema-work" });
 console.log(doctor({ of: process.cwd() }));
-console.log(list({ of: process.cwd() }));
+console.log(diff({ at: workspace })); // changes inside the rift vs its source
+land({ at: workspace }); // apply them back into the source
 remove({ at: workspace });
 gc();
 ```
@@ -219,7 +235,15 @@ remove(options: { at?: string; all: true; hooks?: boolean; database?: string }):
 list(options?: { of?: string; database?: string }): string[]
 ancestors(options?: { of?: string; database?: string }): string[]
 gc(options?: { database?: string }): string[]
+diff(options?: { at?: string; database?: string }): { from: string; to: string; entries: { path: string; kind: "added" | "removed" | "changed" }[] }
+land(options?: { at?: string; database?: string }): TreeDiff
+sync(options?: { at?: string; database?: string }): TreeDiff
 ```
+
+Per-platform binary packages (`rift-snapshot-darwin-arm64`, `rift-snapshot-linux-x64`, `rift-snapshot-linux-musl-*`,
+etc.) are published alongside the launcher and installed automatically as optional dependencies, so installs only
+download the binary for the current platform. The bundled prebuilds remain the fallback when a platform package is
+unavailable.
 
 On Node.js 26.1 or later the binding uses the experimental FFI API (`node --experimental-ffi`, plus `--allow-ffi`
 under the permission model). Older supported Node versions run the same API through the bundled CLI, so no flag is
