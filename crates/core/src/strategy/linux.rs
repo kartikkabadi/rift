@@ -15,10 +15,18 @@ impl Strategy for LinuxStrategy {
         let destination_parent = to
             .parent()
             .ok_or_else(|| Error::Path(format!("destination has no parent: {}", to.display())))?;
-        match (
-            filesystem(from)?,
-            same_filesystem(from, destination_parent)?,
-        ) {
+        let fs = filesystem(from)?;
+        let same = same_filesystem(from, destination_parent)?;
+        eprintln!(
+            "[copy-dispatch] from={} fs={fs:?} same={same} dest_parent={} ftype={:#x} fsid={:?} | dst ftype={:#x} fsid={:?}",
+            from.display(),
+            destination_parent.display(),
+            statfs(from)?.f_type,
+            statfs(from)?.f_fsid,
+            statfs(destination_parent)?.f_type,
+            statfs(destination_parent)?.f_fsid,
+        );
+        match (fs, same) {
             (Filesystem::Btrfs, true) => BtrfsStrategy.copy_directory(from, to, mode, cow),
             (Filesystem::Other, true) => match verify_reflinks_linux(destination_parent) {
                 Ok(()) => LinuxReflinkStrategy.copy_directory(from, to, mode, cow),
