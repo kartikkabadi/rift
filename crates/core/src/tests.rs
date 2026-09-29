@@ -33,6 +33,17 @@ fn create_options(copy_mode: CopyMode, hook_mode: HookMode) -> CreateOptions {
         .hook_mode(hook_mode)
 }
 
+// Hook scripts run through the platform shell; cmd's `echo` appends CRLF
+// (and keeps the space before `>>`), so compare logical lines.
+fn log_lines(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn child_path(source: &Path, name: &str) -> PathBuf {
     source.parent().unwrap().join(".rifts/app").join(name)
 }
@@ -292,14 +303,8 @@ run = "echo post >> lifecycle.log"
         .create(create_input(source.clone(), "lifecycle"))
         .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(source.join("lifecycle.log")).unwrap(),
-        "pre\n"
-    );
-    assert_eq!(
-        fs::read_to_string(child.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&source.join("lifecycle.log")), "pre");
+    assert_eq!(log_lines(&child.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
@@ -506,10 +511,7 @@ run = "echo post >> lifecycle.log"
     manager.remove(&child).unwrap();
 
     assert!(!child.exists());
-    assert_eq!(
-        fs::read_to_string(trash.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&trash.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
