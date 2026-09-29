@@ -712,6 +712,10 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let parent = self.parent(&record, "land")?;
+        marker::verify(&parent.path, &parent.id)?;
+        // Landing replays `.git` file-by-file, so refuse to copy a repository
+        // that is mid-merge/rebase or lock-file'd — a torn state could land.
+        git::check_source(&record.path)?;
         let diff = diff::diff_trees(&parent.path, &record.path)?;
         diff::apply_diff(&diff)?;
         Ok(diff)
@@ -723,6 +727,8 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let parent = self.parent(&record, "sync")?;
+        marker::verify(&parent.path, &parent.id)?;
+        git::check_source(&parent.path)?;
         let diff = diff::diff_trees(&record.path, &parent.path)?;
         diff::apply_diff(&diff)?;
         Ok(diff)

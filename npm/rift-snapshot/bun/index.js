@@ -1,4 +1,5 @@
 import { CString, dlopen, ptr } from "bun:ffi"
+import childProcess from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -28,26 +29,60 @@ const libraryPath = path.join(
   directory,
   platform === "windows" ? "rift_ffi.dll" : platform === "darwin" ? "librift_ffi.dylib" : "librift_ffi.so",
 )
-if (!fs.existsSync(libraryPath)) {
-  throw new Error(`Unable to locate the Rift native library for ${flavor}-${arch}. Reinstall rift-snapshot.`)
+const binaryPath = path.join(directory, platform === "windows" ? "rift.exe" : "rift")
+
+const encoder = new TextEncoder()
+function loadFfi(libraryPath) {
+  const { symbols } = dlopen(libraryPath, {
+    rift_ffi_call: { args: ["ptr"], returns: "ptr" },
+    rift_ffi_free: { args: ["ptr"], returns: "void" },
+  })
+  return (request) => {
+    const input = encoder.encode(`${JSON.stringify(request)}\0`)
+    const output = symbols.rift_ffi_call(ptr(input))
+    if (!output) throw new Error("Rift native library returned no response")
+    let response
+    try {
+      response = JSON.parse(new CString(output).toString())
+    } finally {
+      symbols.rift_ffi_free(output)
+    }
+    return response
+  }
 }
 
-const { symbols } = dlopen(libraryPath, {
-  rift_ffi_call: { args: ["ptr"], returns: "ptr" },
-  rift_ffi_free: { args: ["ptr"], returns: "void" },
-})
-const encoder = new TextEncoder()
+// Platforms without a shared library (musl ships the CLI only) use the
+// `rift rpc` subprocess entry point instead.
+function loadSubprocess(binaryPath) {
+  return (request) => {
+    const result = childProcess.spawnSync(binaryPath, ["rpc"], {
+      input: JSON.stringify(request),
+      encoding: "utf8",
+      windowsHide: true,
+    })
+    if (result.error) throw result.error
+    if (result.status !== 0) {
+      throw new Error(`Rift failed (exit ${result.status}): ${result.stderr || result.stdout}`.trim())
+    }
+    return JSON.parse(result.stdout)
+  }
+}
+
+let ffi = null
+if (fs.existsSync(libraryPath)) {
+  try {
+    ffi = loadFfi(libraryPath)
+  } catch {}
+}
+const run = ffi ?? (() => {
+  if (!fs.existsSync(binaryPath)) {
+    throw new Error(`Unable to locate the Rift binaries for ${flavor}-${arch}. Reinstall rift-snapshot.`)
+  }
+  return loadSubprocess(binaryPath)
+})()
 
 function call(request) {
-  const input = encoder.encode(`${JSON.stringify(request)}\0`)
-  const output = symbols.rift_ffi_call(ptr(input))
-  if (!output) throw new Error("Rift native library returned no response")
-  let response
-  try {
-    response = JSON.parse(new CString(output).toString())
-  } finally {
-    symbols.rift_ffi_free(output)
-  }
+  const response = run(request)
   if (response.status === "error") throw new RiftError(response.error)
   return response.value
 }

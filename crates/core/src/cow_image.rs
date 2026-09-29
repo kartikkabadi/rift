@@ -78,9 +78,7 @@ mod linux {
             .copied()
             .find(|fs| on_path(&format!("mkfs.{fs}")))
             .ok_or_else(|| {
-                Error::CowImageSetup(
-                    "no mkfs tool found; install btrfs-progs or xfsprogs".into(),
-                )
+                Error::CowImageSetup("no mkfs tool found; install btrfs-progs or xfsprogs".into())
             })?;
         let sudo = sudo_command()?;
 
@@ -131,11 +129,9 @@ mod linux {
             &format!("mount {}", mountpoint.display()),
         )?;
         if !sudo.is_empty() {
-            let owner = format!(
-                "{}:{}",
-                unsafe { libc::geteuid() },
-                unsafe { libc::getegid() }
-            );
+            let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                libc::getegid()
+            });
             run(
                 command(sudo, "chown").arg(owner).arg(mountpoint),
                 "hand the mount to the current user",
@@ -199,9 +195,14 @@ mod linux {
         filesystem: &str,
         sudo: &[OsString],
     ) -> std::result::Result<(), String> {
-        if mountpoint.to_string_lossy().contains(' ') || image.to_string_lossy().contains(' ') {
+        // fstab is line- and whitespace-delimited, so any whitespace in the
+        // path would corrupt (or inject into) the file — decline to write it.
+        if [&mountpoint, &image]
+            .iter()
+            .any(|path| path.to_string_lossy().chars().any(char::is_whitespace))
+        {
             return Err(format!(
-                "path contains spaces; add this to /etc/fstab yourself: {} {} {} loop 0 0",
+                "path contains whitespace; add this to /etc/fstab yourself: {} {} {} loop 0 0",
                 image.display(),
                 mountpoint.display(),
                 filesystem
