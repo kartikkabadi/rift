@@ -72,6 +72,9 @@ jobs:
           - filesystem: tmpfs
             packages: ""
             required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
+          - filesystem: f2fs
+            packages: f2fs-tools
+            required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -104,3 +107,106 @@ jobs:
         env:
           RIFT_REQUIRE_APFS_TESTS: "1"
         run: cargo test --package rift --locked
+
+  windows-test:
+    name: Windows tests
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  linux-arm-test:
+    name: Linux arm64 tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  musl-test:
+    name: Alpine/musl smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build and smoke test in Alpine
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src rust:alpine \
+            sh -c 'set -e
+            apk add --no-cache musl-dev pkgconf
+            cargo build --workspace --release --locked --target x86_64-unknown-linux-musl
+            binary="./target/x86_64-unknown-linux-musl/release/rift"
+            "$binary" doctor /src
+            mkdir /tmp/ws
+            "$binary" init /tmp/ws --here
+            "$binary" create /tmp/ws --name child
+            "$binary" list /tmp/ws'
+
+  npm-e2e:
+    name: npm package end-to-end (${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24", "26"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Build native artifacts
+        run: cargo build --package rift-cli --package rift-ffi --release --locked
+
+      - name: Populate prebuild
+        run: node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/linux-x64" "target/release/rift" "target/release/librift_ffi.so"
+
+      - name: Pack and install
+        run: |
+          mkdir -p dist e2e
+          (cd npm/rift-snapshot && npm pack --pack-destination ../../dist)
+          cd e2e
+          npm init -y >/dev/null
+          npm install ../dist/rift-snapshot-*.tgz
+
+      - name: Exercise CLI and Node API
+        working-directory: e2e
+        run: |
+          mkdir workspace
+          npx rift init workspace --here
+          npx rift create workspace --name child
+          npx rift doctor workspace
+          node --input-type=module -e "
+            const rift = await import('rift-snapshot')
+            const fs = await import('node:fs')
+            const path = await import('node:path')
+            const dir = fs.mkdtempSync(path.join(process.cwd(), 'api-'))
+            const source = path.join(dir, 'src')
+            fs.mkdirSync(source)
+            fs.writeFileSync(path.join(source, 'file.txt'), 'api content')
+            rift.init({ at: source })
+            const child = rift.create({ from: source, name: 'kid' })
+            if (fs.readFileSync(path.join(child, 'file.txt'), 'utf8') !== 'api content')
+              throw new Error('copy diverged')
+            const probe = rift.doctor({ of: source })
+            if (!probe.backend) throw new Error('doctor returned no backend')
+            console.log('api e2e ok:', probe.backend)
+          "

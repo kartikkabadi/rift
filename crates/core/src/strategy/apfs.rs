@@ -1,5 +1,5 @@
-use super::{Strategy, create_destination};
-use crate::{CopyMode, Error, Result, filter::CopyFilter};
+use super::{Strategy, StrategyInit, create_destination, portable::PortableStrategy};
+use crate::{Backend, CopyMode, CowMode, Error, InitProgress, Result, filter::CopyFilter};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -7,12 +7,86 @@ use walkdir::WalkDir;
 pub(super) struct ApfsStrategy;
 
 impl Strategy for ApfsStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, cow: CowMode) -> Result<()> {
+        let destination_parent = to
+            .parent()
+            .ok_or_else(|| Error::Path(format!("destination has no parent: {}", to.display())))?;
+        if !supports_clonefile(from, destination_parent)? {
+            return match cow {
+                CowMode::Require => Err(Error::CowUnavailable(format!(
+                    "{} and {} are not on the same APFS volume; run without --cow-only to allow a regular copy",
+                    from.display(),
+                    to.display()
+                ))),
+                CowMode::Auto => PortableStrategy.copy_directory(from, to, mode, cow),
+            };
+        }
         match mode {
             CopyMode::All => clone_path_apfs(from, to),
             CopyMode::Filtered => clone_filtered_directory_apfs(from, to),
         }
     }
+
+    fn initialize_directory(
+        &self,
+        path: &Path,
+        _progress: &mut dyn FnMut(InitProgress),
+        cow: CowMode,
+    ) -> Result<StrategyInit> {
+        if is_apfs(path)? {
+            return Ok(StrategyInit::AlreadyNative);
+        }
+        match cow {
+            CowMode::Require => Err(Error::CowUnavailable(format!(
+                "{} is not on APFS, so copy-on-write clones are unavailable",
+                path.display()
+            ))),
+            CowMode::Auto => Ok(StrategyInit::Degraded),
+        }
+    }
+
+    fn probe(&self, path: &Path) -> Result<Backend> {
+        Ok(if is_apfs(path)? {
+            Backend::Apfs
+        } else {
+            Backend::Portable
+        })
+    }
+}
+
+/// `clonefile` requires the source and destination on the same APFS volume.
+fn supports_clonefile(from: &Path, destination_parent: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(is_apfs(from)?
+        && is_apfs(destination_parent)?
+        && fs::metadata(from)?.dev() == fs::metadata(destination_parent)?.dev())
+}
+
+fn is_apfs(path: &Path) -> Result<bool> {
+    Ok(filesystem_name(path).as_deref() == Some("apfs"))
+}
+
+/// The volume's filesystem type name, as reported by `statfs`.
+pub(super) fn filesystem_name(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` is a plain C struct; zero initialization is a valid
+    // starting state before the kernel fills it.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid C string, and `stat` points to writable memory
+    // for the kernel to initialize.
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let name: Vec<u8> = stat
+        .f_fstypename
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    Some(String::from_utf8_lossy(&name).into_owned())
 }
 
 fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
@@ -291,7 +365,7 @@ mod tests {
         let strategy = ApfsStrategy;
 
         strategy
-            .copy_directory(&source, &destination, CopyMode::All)
+            .copy_directory(&source, &destination, CopyMode::All, CowMode::Auto)
             .unwrap();
         assert_eq!(
             fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
@@ -310,7 +384,7 @@ mod tests {
             fs::create_dir(&source).unwrap();
             assert!(
                 ApfsStrategy
-                    .copy_directory(&source, &destination, CopyMode::All)
+                    .copy_directory(&source, &destination, CopyMode::All, CowMode::Auto)
                     .is_ok()
             );
         }
@@ -393,7 +467,7 @@ mod tests {
         fs::set_permissions(&object, fs::Permissions::from_mode(0o444)).unwrap();
 
         ApfsStrategy
-            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .copy_directory(&source, &destination, CopyMode::Filtered, CowMode::Auto)
             .unwrap();
 
         let copied = destination.join(".git/objects/0d/8a474f");
@@ -440,7 +514,7 @@ mod tests {
         let destination_root = TempDir::new().unwrap();
         let destination = destination_root.path().join("destination");
         ApfsStrategy
-            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .copy_directory(&source, &destination, CopyMode::Filtered, CowMode::Auto)
             .unwrap();
 
         assert_eq!(
@@ -462,7 +536,8 @@ mod tests {
         write_xattr(&locked, "user.rift", b"dir");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let result = ApfsStrategy.copy_directory(&source, &destination, CopyMode::Filtered);
+        let result =
+            ApfsStrategy.copy_directory(&source, &destination, CopyMode::Filtered, CowMode::Auto);
 
         // Restore write access so the temporary directory can be cleaned up.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
@@ -502,7 +577,7 @@ mod tests {
         fs::write(source.join("node_modules/pkg/index.js"), "module").unwrap();
 
         ApfsStrategy
-            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .copy_directory(&source, &destination, CopyMode::Filtered, CowMode::Auto)
             .unwrap();
 
         assert!(!destination.join("node_modules").exists());

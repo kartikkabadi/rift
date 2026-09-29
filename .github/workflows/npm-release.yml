@@ -39,6 +39,23 @@ jobs:
             platform: linux-x64
             executable: rift
             library: librift_ffi.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            executable: rift
+            library: librift_ffi.so
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-musl-x64
+            executable: rift
+            library: librift_ffi.so
+            image: rust:alpine
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux-musl-arm64
+            executable: rift
+            library: librift_ffi.so
+            image: rust:alpine
           - os: macos-14
             target: x86_64-apple-darwin
             platform: darwin-x64
@@ -54,25 +71,46 @@ jobs:
             platform: windows-x64
             executable: rift.exe
             library: rift_ffi.dll
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            executable: rift.exe
+            library: rift_ffi.dll
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        if: matrix.image == ''
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install Node.js
+        if: matrix.image == ''
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
+      - name: Build native artifacts (in container)
+        if: matrix.image != ''
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src ${{ matrix.image }} \
+            sh -c "apk add --no-cache musl-dev pkgconf && cargo build --package rift-cli --package rift-ffi --release --locked --target ${{ matrix.target }}"
+
+      - name: Install Node.js (in container)
+        if: matrix.image != ''
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src ${{ matrix.image }} \
+            sh -c "apk add --no-cache nodejs && node scripts/prepare-npm-prebuild.mjs 'npm/rift-snapshot/prebuilds/${{ matrix.platform }}' 'target/${{ matrix.target }}/release/${{ matrix.executable }}' 'target/${{ matrix.target }}/release/${{ matrix.library }}'"
+
       - name: Build native artifacts
+        if: matrix.image == ''
         run: cargo build --package rift-cli --package rift-ffi --release --locked --target ${{ matrix.target }}
 
       - name: Populate prebuild
+        if: matrix.image == ''
         shell: bash
         run: node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/${{ matrix.platform }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "target/${{ matrix.target }}/release/${{ matrix.library }}"
 
@@ -118,14 +156,38 @@ jobs:
           name: npm-prebuild-darwin-arm64
           path: npm/rift-snapshot/prebuilds/darwin-arm64
 
+      - name: Download Linux arm64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-linux-arm64
+          path: npm/rift-snapshot/prebuilds/linux-arm64
+
+      - name: Download Linux musl x64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-linux-musl-x64
+          path: npm/rift-snapshot/prebuilds/linux-musl-x64
+
+      - name: Download Linux musl arm64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-linux-musl-arm64
+          path: npm/rift-snapshot/prebuilds/linux-musl-arm64
+
       - name: Download Windows x64 prebuild
         uses: actions/download-artifact@v4
         with:
           name: npm-prebuild-windows-x64
           path: npm/rift-snapshot/prebuilds/windows-x64
 
+      - name: Download Windows arm64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-windows-arm64
+          path: npm/rift-snapshot/prebuilds/windows-arm64
+
       - name: Restore executable permissions
-        run: chmod +x npm/rift-snapshot/prebuilds/linux-x64/* npm/rift-snapshot/prebuilds/darwin-x64/* npm/rift-snapshot/prebuilds/darwin-arm64/*
+        run: chmod +x npm/rift-snapshot/prebuilds/linux-x64/* npm/rift-snapshot/prebuilds/linux-arm64/* npm/rift-snapshot/prebuilds/linux-musl-x64/* npm/rift-snapshot/prebuilds/linux-musl-arm64/* npm/rift-snapshot/prebuilds/darwin-x64/* npm/rift-snapshot/prebuilds/darwin-arm64/*
 
       - name: Publish launcher package
         run: npm publish ./npm/rift-snapshot --provenance

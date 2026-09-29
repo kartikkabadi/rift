@@ -1,4 +1,6 @@
-use crate::{CopyMode, Create, CreateOptions, Error, HookMode, Manager, RemoveOptions};
+use crate::{
+    CopyMode, CowMode, Create, CreateOptions, Error, HookMode, Manager, Probe, RemoveOptions,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -14,6 +16,8 @@ struct Request {
 enum Command {
     Init {
         at: PathBuf,
+        #[serde(rename = "cowOnly")]
+        cow_only: Option<bool>,
     },
     Create {
         from: PathBuf,
@@ -22,6 +26,11 @@ enum Command {
         #[serde(rename = "copyAll")]
         copy_all: Option<bool>,
         hooks: Option<bool>,
+        #[serde(rename = "cowOnly")]
+        cow_only: Option<bool>,
+    },
+    Doctor {
+        of: PathBuf,
     },
     Remove {
         at: PathBuf,
@@ -46,6 +55,7 @@ enum Value {
     Empty(()),
     Path(PathBuf),
     Paths(Vec<PathBuf>),
+    Report(Probe),
 }
 
 #[derive(Serialize)]
@@ -139,6 +149,14 @@ pub fn error(code: &'static str, message: impl Into<String>) -> String {
     })
 }
 
+fn cow_mode(cow_only: Option<bool>) -> CowMode {
+    if cow_only.unwrap_or(false) {
+        CowMode::Require
+    } else {
+        CowMode::Auto
+    }
+}
+
 fn serialize(response: Response) -> String {
     serde_json::to_string(&response).unwrap_or_else(|_| {
         r#"{"status":"error","error":{"code":"serialization","message":"failed to serialize response"}}"#
@@ -154,8 +172,8 @@ fn execute(input: &str) -> Result<Value, Failure> {
         .map_or_else(Manager::open_default, Manager::open)
         .map_err(Failure::from)?;
     match request.command {
-        Command::Init { at } => manager
-            .init(at)
+        Command::Init { at, cow_only } => manager
+            .init_with_cow_mode(at, cow_mode(cow_only), |_| {})
             .map(|_| Value::Empty(()))
             .map_err(Failure::from),
         Command::Create {
@@ -164,6 +182,7 @@ fn execute(input: &str) -> Result<Value, Failure> {
             into,
             copy_all,
             hooks,
+            cow_only,
         } => manager
             .create_with_options(
                 Create::new(from).with_name(name).with_storage(into),
@@ -177,10 +196,12 @@ fn execute(input: &str) -> Result<Value, Failure> {
                         HookMode::Run
                     } else {
                         HookMode::Skip
-                    }),
+                    })
+                    .cow_mode(cow_mode(cow_only)),
             )
             .map(Value::Path)
             .map_err(Failure::from),
+        Command::Doctor { of } => manager.probe(of).map(Value::Report).map_err(Failure::from),
         Command::Remove { at, all, hooks } => {
             let options = RemoveOptions::default().hook_mode(if hooks.unwrap_or(true) {
                 HookMode::Run
@@ -245,7 +266,7 @@ mod tests {
     #[test]
     fn accepts_create_and_remove_options() {
         let create = serde_json::from_str::<Request>(
-            r#"{"command":"create","from":"/tmp/app","copyAll":true,"hooks":false}"#,
+            r#"{"command":"create","from":"/tmp/app","copyAll":true,"hooks":false,"cowOnly":true}"#,
         )
         .unwrap();
         let remove = serde_json::from_str::<Request>(
@@ -258,6 +279,7 @@ mod tests {
             Command::Create {
                 copy_all: Some(true),
                 hooks: Some(false),
+                cow_only: Some(true),
                 ..
             }
         ));
@@ -269,5 +291,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn accepts_init_cow_only_and_doctor() {
+        let init =
+            serde_json::from_str::<Request>(r#"{"command":"init","at":"/tmp/app","cowOnly":true}"#)
+                .unwrap();
+        let doctor =
+            serde_json::from_str::<Request>(r#"{"command":"doctor","of":"/tmp/app"}"#).unwrap();
+
+        assert!(matches!(
+            init.command,
+            Command::Init {
+                cow_only: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(doctor.command, Command::Doctor { .. }));
     }
 }

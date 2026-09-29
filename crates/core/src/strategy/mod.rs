@@ -1,5 +1,5 @@
-use crate::{CopyMode, InitProgress, Result};
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+use crate::{Backend, CopyMode, CowMode, InitProgress, Result};
+#[cfg(test)]
 use crate::{Error, filter::CopyFilter};
 use std::fs;
 use std::io;
@@ -11,16 +11,22 @@ mod apfs;
 mod btrfs;
 #[cfg(target_os = "linux")]
 mod linux;
+mod portable;
 #[cfg(target_os = "linux")]
 mod reflink;
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub(crate) trait Strategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()>;
+    /// Copies `from` to `to`. When `cow` is `CowMode::Require`, filesystems
+    /// without a copy-on-write mechanism fail instead of copying normally.
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, cow: CowMode) -> Result<()>;
 
     fn initialize_directory(
         &self,
         _path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         Ok(StrategyInit::AlreadyNative)
     }
@@ -29,6 +35,9 @@ pub(crate) trait Strategy {
         fs::remove_dir_all(path)?;
         Ok(())
     }
+
+    /// Reports which copy mechanism `copy_directory` would use for `path`.
+    fn probe(&self, path: &Path) -> Result<Backend>;
 }
 
 fn create_destination(path: &Path) -> Result<()> {
@@ -43,6 +52,9 @@ fn create_destination(path: &Path) -> Result<()> {
 pub(crate) enum StrategyInit {
     AlreadyNative,
     Converted,
+    /// The workspace registered, but the filesystem cannot copy-on-write, so
+    /// workspaces created from it will be regular copies.
+    Degraded,
 }
 
 pub(crate) fn default_strategy() -> Box<dyn Strategy> {
@@ -52,19 +64,25 @@ pub(crate) fn default_strategy() -> Box<dyn Strategy> {
     #[cfg(target_os = "macos")]
     return Box::new(apfs::ApfsStrategy);
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return Box::new(UnsupportedStrategy);
+    #[cfg(target_os = "windows")]
+    return Box::new(windows::WindowsStrategy);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    return Box::new(portable::PortableStrategy);
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-struct UnsupportedStrategy;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-impl Strategy for UnsupportedStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
-        Err(Error::CowUnavailable(
-            "no copy-on-write strategy has been implemented for this platform".into(),
-        ))
+/// The filesystem type name at `path`, when the platform can report it.
+pub(crate) fn filesystem_name(path: &Path) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return linux::filesystem_name(path);
+    #[cfg(target_os = "macos")]
+    return apfs::filesystem_name(path);
+    #[cfg(target_os = "windows")]
+    return windows::filesystem_name(path);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -90,7 +108,7 @@ pub(crate) struct TestStrategy;
 
 #[cfg(test)]
 impl Strategy for TestStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, _cow: CowMode) -> Result<()> {
         create_destination(to)?;
         let filter = CopyFilter;
         for entry in walkdir::WalkDir::new(from)
@@ -124,6 +142,10 @@ impl Strategy for TestStrategy {
         }
         Ok(())
     }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
+    }
 }
 
 #[cfg(test)]
@@ -131,7 +153,17 @@ pub(crate) struct FailureStrategy;
 
 #[cfg(test)]
 impl Strategy for FailureStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         Err(Error::CowUnavailable("test failure".into()))
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }

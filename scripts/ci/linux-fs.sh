@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: linux-fs.sh <btrfs|xfs-reflink|xfs-no-reflink|ext4|tmpfs|zfs> [-- <command> ...]" >&2
+  echo "usage: linux-fs.sh <btrfs|xfs-reflink|xfs-no-reflink|ext4|tmpfs|zfs|f2fs> [-- <command> ...]" >&2
 }
 
 if [[ $# -lt 1 ]]; then
@@ -47,6 +47,9 @@ expected_fstype() {
       ;;
     tmpfs)
       echo "tmpfs"
+      ;;
+    f2fs)
+      echo "f2fs"
       ;;
     zfs)
       echo "zfs"
@@ -143,6 +146,10 @@ create_mount() {
       ;;
     tmpfs)
       sudo mount -t tmpfs -o size=1G tmpfs "${mountpoint}"
+      ;;
+    f2fs)
+      format_loopback 1G mkfs.f2fs -f
+      mount_loopback
       ;;
     zfs)
       pool="rift-ci-${GITHUB_RUN_ID:-$$}-${RANDOM}"

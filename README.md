@@ -31,11 +31,15 @@ rift gc
 Add shell integration to `cd` automatically after `init`, `create`, and `remove`:
 
 ```bash
-eval "$(rift shell-init zsh)" # or bash
+eval "$(rift shell-init zsh)" # or bash or fish
 ```
 
 ```nushell
 rift shell-init nushell | save -f (($nu.user-autoload-dirs | first) | path join "rift.nu")
+```
+
+```powershell
+rift shell-init powershell | Invoke-Expression
 ```
 
 ## Lifecycle Hooks
@@ -119,7 +123,8 @@ rift create --no-hooks
 
 Copies the nearest managed workspace, records it as the parent, and prints the new workspace path. Filtered copies
 omit regenerable artifacts such as `node_modules`, `target`, virtualenvs, framework caches, `dist`, `build`, and
-`coverage`; manifests and lockfiles are kept. `--copy-all` makes an exact copy.
+`coverage`; manifests and lockfiles are kept. `--copy-all` makes an exact copy. `--cow-only` fails instead of falling
+back to a regular copy on filesystems that cannot clone instantly.
 
 Git repositories are copied with detached `HEAD`, preserving index and working-tree state. Linked worktrees and
 repositories with in-progress merges, rebases, cherry-picks, reverts, bisects, or lock files are rejected.
@@ -132,6 +137,17 @@ rift ancestors
 ```
 
 `list` prints direct child workspaces. `ancestors` prints parent workspaces, nearest first.
+
+### `rift doctor`
+
+```bash
+rift doctor
+rift doctor --json
+```
+
+Reports the filesystem type and which copy method new rifts will use — instant copies (btrfs snapshots, Linux
+reflinks, APFS `clonefile`, or ReFS block cloning) or a regular file-by-file copy when the filesystem cannot clone.
+Use it to check a machine or a specific path before initializing.
 
 ### `rift remove` and `rift gc`
 
@@ -148,12 +164,16 @@ keeps the source directory, removes its `.rift` marker, and trashes registered d
 
 ## How It Works
 
-| Platform          | Backend                  | Notes                                                  |
-| ----------------- | ------------------------ | ------------------------------------------------------ |
-| Linux x64         | btrfs snapshots          | `rift init` converts a directory into a subvolume       |
-| Linux x64         | Native per-file reflinks | XFS and other filesystems with working `FICLONE`        |
-| macOS arm64 / x64 | APFS `clonefile`         | Requires an APFS volume                                 |
-| Windows x64       | None                     | Package is published; workspace creation is unsupported |
+| Platform             | Instant-copy backend          | Fallback                                                       |
+| -------------------- | ------------------------------ | -------------------------------------------------------------- |
+| Linux x64 / arm64    | btrfs snapshots, or reflinks   | Regular copy on ext4, tmpfs, NFS, and other filesystems          |
+| macOS arm64 / x64    | APFS `clonefile`               | Regular copy on exFAT, FAT32, network volumes, etc.              |
+| Windows x64 / arm64  | ReFS block cloning (Dev Drive) | Regular copy on NTFS and other filesystems                       |
+
+`rift init` works on every filesystem: it picks the instant-copy backend when one exists and otherwise registers the
+workspace for regular copies with a note. `--cow-only` requires an instant-copy backend and fails instead. Release
+archives and npm prebuilds cover Linux glibc and musl (any distro, including Alpine), macOS, and Windows on x64 and
+arm64.
 
 Each managed workspace has a `.rift` marker containing its ID. A SQLite registry stores paths, parents, and trash
 entries. Default storage is adjacent to the source root:
@@ -169,20 +189,22 @@ until `rift gc` runs.
 
 ## JavaScript API
 
-The package selects a Bun or Node FFI binding through conditional exports.
+The package selects a Bun or Node binding through conditional exports.
 
 ```ts
-import { create, list, remove, gc } from "rift-snapshot";
+import { create, doctor, list, remove, gc } from "rift-snapshot";
 
 const workspace = create({ from: process.cwd(), name: "schema-work" });
+console.log(doctor({ of: process.cwd() }));
 console.log(list({ of: process.cwd() }));
 remove({ at: workspace });
 gc();
 ```
 
 ```ts
-init(options?: { at?: string; database?: string }): null
-create(options?: { from?: string; name?: string; into?: string; copyAll?: boolean; hooks?: boolean; database?: string }): string
+init(options?: { at?: string; cowOnly?: boolean; database?: string }): null
+create(options?: { from?: string; name?: string; into?: string; copyAll?: boolean; hooks?: boolean; cowOnly?: boolean; database?: string }): string
+doctor(options?: { of?: string; database?: string }): { path: string; backend: string; filesystem: string | null }
 remove(options?: { at?: string; all?: false; hooks?: boolean; database?: string }): void
 remove(options: { at?: string; all: true; hooks?: boolean; database?: string }): string[]
 list(options?: { of?: string; database?: string }): string[]
@@ -190,10 +212,10 @@ ancestors(options?: { of?: string; database?: string }): string[]
 gc(options?: { database?: string }): string[]
 ```
 
-Node requires the experimental FFI API in Node.js 26.1 or later (`node --experimental-ffi`, plus `--allow-ffi` under
-the permission model). `init` initializes exactly `at`; Git-root selection is CLI behavior. Calls are synchronous, so
-lifecycle hooks block the caller. Failures throw `RiftError` with `code`, and when relevant `path`, `hook`, and
-`committed`.
+On Node.js 26.1 or later the binding uses the experimental FFI API (`node --experimental-ffi`, plus `--allow-ffi`
+under the permission model). Older supported Node versions run the same API through the bundled CLI, so no flag is
+needed there. `init` initializes exactly `at`; Git-root selection is CLI behavior. Calls are synchronous, so lifecycle
+hooks block the caller. Failures throw `RiftError` with `code`, and when relevant `path`, `hook`, and `committed`.
 
 ## Development
 

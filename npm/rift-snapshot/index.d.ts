@@ -6,12 +6,19 @@ export interface AtOptions extends Options {
   at?: string
 }
 
+export interface InitOptions extends AtOptions {
+  /** Fail instead of falling back to a regular copy when the filesystem cannot clone instantly. */
+  cowOnly?: boolean
+}
+
 export interface CreateOptions extends Options {
   from?: string
   name?: string
   into?: string
   copyAll?: boolean
   hooks?: boolean
+  /** Fail instead of falling back to a regular copy when the filesystem cannot clone instantly. */
+  cowOnly?: boolean
 }
 
 export interface RemoveOptions extends AtOptions {
@@ -61,8 +68,19 @@ export class RiftError extends Error {
   })
 }
 
-export function init(options?: AtOptions): null
+/** The copy mechanism `create` will use for a workspace path. */
+export type Backend = "btrfs" | "reflink" | "apfs" | "refs" | "portable"
+
+export interface Probe {
+  path: string
+  backend: Backend
+  /** The filesystem type name when the platform can report it. */
+  filesystem: string | null
+}
+
+export function init(options?: InitOptions): null
 export function create(options?: CreateOptions): string
+export function doctor(options?: OfOptions): Probe
 export function remove(options?: RemoveOptions & { all: true }): string[]
 export function remove(options?: RemoveOptions): void
 export function list(options?: OfOptions): string[]

@@ -609,7 +609,13 @@ struct InitializingStrategy {
 }
 
 impl Strategy for InitializingStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         unreachable!()
     }
 
@@ -617,9 +623,14 @@ impl Strategy for InitializingStrategy {
         &self,
         _path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         self.initialized.set(true);
         Ok(StrategyInit::Converted)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 
@@ -1115,21 +1126,35 @@ fn linked_git_directory_is_rejected_during_initialization() {
 struct PartialFailureStrategy;
 
 impl Strategy for PartialFailureStrategy {
-    fn copy_directory(&self, _from: &Path, to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         fs::create_dir(to)?;
         fs::write(to.join("copied-before-failure.txt"), "partial")?;
         fs::create_dir(to.join("nested"))?;
         fs::write(to.join("nested/file.txt"), "partial")?;
         Err(Error::CowUnavailable("partial failure".into()))
     }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
+    }
 }
 
 struct CollisionStrategy;
 
 impl Strategy for CollisionStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, cow: CowMode) -> Result<()> {
         fs::create_dir(to)?;
-        TestStrategy.copy_directory(from, to, mode)
+        TestStrategy.copy_directory(from, to, mode, cow)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 

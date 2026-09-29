@@ -2,7 +2,7 @@
 
 ## Requirement
 
-`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. On Linux, managed workspaces use either btrfs subvolumes for instantaneous writable snapshots or native per-file reflinks for copy-on-write tree cloning.
+`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. On Linux, managed workspaces use either btrfs subvolumes for instantaneous writable snapshots or native per-file reflinks for copy-on-write tree cloning. On macOS they use APFS `clonefile`; on Windows, ReFS block cloning where available. Every platform falls back to an ordinary file-by-file copy when no instant-copy backend applies, so the same commands work on any filesystem.
 
 ## API
 
@@ -11,15 +11,17 @@
 ```ts
 init(input: {
   at: AbsolutePath
+  cowOnly?: boolean
 }): void
 ```
 
 `init` prepares and registers an original workspace for Rift.
 
-- On Linux, `at` must be on btrfs or a filesystem with native reflink support; on other supported systems, initialization registers the workspace without filesystem conversion.
+- On Linux, `at` uses btrfs or native reflinks when available; on other supported systems, initialization registers the workspace without filesystem conversion.
+- When no instant-copy backend applies to `at`, `init` registers the workspace anyway and reports that future `create` calls will be regular copies. The `--cow-only` flag turns this into a hard failure for callers that require instant copies.
 - If `at` is already a btrfs subvolume, register it without replacing it.
 - If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume and atomically replace the original directory at its existing path.
-- On other Linux filesystems, verify native reflink support and register `at` without replacing it.
+- On other Linux filesystems, verify native reflink support and register `at` without replacing it; when reflinks are unavailable, register `at` in regular-copy mode.
 - The original directory is retained under an internal temporary path only while it is needed for rollback and is removed before a successful `init` returns.
 - The core operation initializes exactly `at` and does not search parent directories.
 - The CLI defaults `at` to the current working directory; by default it selects the nearest existing managed ancestor or nearest Git root, prints the selected path, and then invokes core `init` with that exact path. `--here` opts into selecting exactly the supplied path.
@@ -35,6 +37,7 @@ create(input: {
   into?: AbsolutePath
   copyAll?: boolean
   hooks?: boolean
+  cowOnly?: boolean
 }): AbsolutePath
 ```
 
@@ -72,7 +75,7 @@ run = "echo removed"
 
 Hooks run sequentially with inherited stdio and environment plus `RIFT_SOURCE`, `RIFT_DESTINATION`, `RIFT_ID`, and `RIFT_PARENT_ID`. Precreate runs in the source workspace and postcreate runs in the destination. The first failing command stops later hooks. A precreate failure prevents copying; after a postcreate failure, the created workspace remains registered and on disk.
 
-On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On other reflink-capable Linux filesystems, clone the directory tree with native per-file reflinks.
+On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On other reflink-capable Linux filesystems, clone the directory tree with native per-file reflinks. When `from` and the destination cannot share an instant-copy backend (unsupported filesystem, or different volumes), `create` produces a regular file-by-file copy unless `--cow-only` was given, in which case it fails.
 
 If `from` is already managed by Rift, create copies that exact directory. Do not resolve back to an earlier workspace. Metadata should record the immediate source rift as its parent.
 
@@ -212,10 +215,10 @@ Copying is implemented behind a `Strategy` interface so platform-specific copy-o
 - The `BtrfsStrategy` production strategy on Linux uses writable btrfs subvolume snapshots.
 - The `BtrfsStrategy` performs native per-file reflink imports when `init` converts an existing ordinary workspace into a subvolume and when filtered `create` materializes only included paths. Exact `create` uses writable btrfs snapshots.
 - The `LinuxReflinkStrategy` production strategy on Linux verifies native reflink support during `init` and uses native per-file reflinks during `create` without spawning an external copy command. XFS uses this path, as do other Linux filesystems when their `FICLONE` support succeeds.
-- The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning for exact copies and per-entry cloning for filtered copies.
-- If no implemented copy-on-write strategy succeeds, `create` fails.
-- Full byte copying is not implemented as a fallback.
-- Future strategies may add Windows copy-on-write support without changing the API.
+- The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning for exact copies and per-entry cloning for filtered copies; `clonefile` requires both paths to share one APFS volume.
+- The `WindowsStrategy` production strategy uses ReFS block cloning (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) when source and destination share an ReFS volume.
+- Every strategy falls back to `PortableStrategy`, an ordinary file-by-file copy that preserves symlinks, permissions, timestamps, and hard links on a best-effort basis, when no instant-copy backend applies to the requested copy. The `--cow-only` flag (API `cowOnly`) disables that fallback and makes `init`/`create` fail instead.
+- Each strategy can `probe` a path for the backend a copy would use; `rift doctor` reports the probe result.
 
 ## Packaging
 
@@ -228,8 +231,8 @@ The project ships four interfaces backed by the same implementation and metadata
 
 The CLI and language bindings should remain thin and expose the same API semantics as the native library.
 
-The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
+The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. Linux targets include glibc and static musl builds; the CLI shim selects the musl build when it detects a musl libc (for example on Alpine). It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
 
 For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted. Workspace operations locate their root by searching upward for its `.rift` marker. The CLI applies similar selection before calling exact-path core `init`, unless `rift init --here` is explicitly requested.
 
-The CLI may provide opt-in Bash, Zsh, and Nushell integration through `rift shell-init <shell>`. The resulting shell function delegates filesystem and registry operations to the executable, then changes the caller's working directory after `init`, `create`, or removal of the current rift. This shell behavior is not part of the native library or FFI APIs.
+The CLI may provide opt-in Bash, Zsh, Nushell, fish, and PowerShell integration through `rift shell-init <shell>`. The resulting shell function delegates filesystem and registry operations to the executable, then changes the caller's working directory after `init`, `create`, or removal of the current rift. This shell behavior is not part of the native library or FFI APIs.

@@ -1,19 +1,33 @@
 import { CString, dlopen, ptr } from "bun:ffi"
+import fs from "node:fs"
 import os from "node:os"
 
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
 if (!platform || !arch) throw new Error(`Unsupported Rift platform: ${os.platform()}-${os.arch()}`)
 
+const report = process.report?.getReport?.()
+const musl =
+  platform === "linux" &&
+  (report ? report.header?.glibcVersionRuntime === undefined : fs.existsSync("/etc/alpine-release"))
+
 let libraryPath
-if (platform === "linux" && arch === "x64") {
+if (platform === "linux" && arch === "x64" && musl) {
+  libraryPath = (await import("../prebuilds/linux-musl-x64/librift_ffi.so", { with: { type: "file" } })).default
+} else if (platform === "linux" && arch === "x64") {
   libraryPath = (await import("../prebuilds/linux-x64/librift_ffi.so", { with: { type: "file" } })).default
+} else if (platform === "linux" && arch === "arm64" && musl) {
+  libraryPath = (await import("../prebuilds/linux-musl-arm64/librift_ffi.so", { with: { type: "file" } })).default
+} else if (platform === "linux" && arch === "arm64") {
+  libraryPath = (await import("../prebuilds/linux-arm64/librift_ffi.so", { with: { type: "file" } })).default
 } else if (platform === "darwin" && arch === "x64") {
   libraryPath = (await import("../prebuilds/darwin-x64/librift_ffi.dylib", { with: { type: "file" } })).default
 } else if (platform === "darwin" && arch === "arm64") {
   libraryPath = (await import("../prebuilds/darwin-arm64/librift_ffi.dylib", { with: { type: "file" } })).default
 } else if (platform === "windows" && arch === "x64") {
   libraryPath = (await import("../prebuilds/windows-x64/rift_ffi.dll", { with: { type: "file" } })).default
+} else if (platform === "windows" && arch === "arm64") {
+  libraryPath = (await import("../prebuilds/windows-arm64/rift_ffi.dll", { with: { type: "file" } })).default
 } else {
   throw new Error(`Unsupported Rift platform: ${platform}-${arch}`)
 }
@@ -49,12 +63,12 @@ export class RiftError extends Error {
   }
 }
 
-export function init({ at = process.cwd(), database } = {}) {
-  return call({ command: "init", at, database })
+export function init({ at = process.cwd(), cowOnly, database } = {}) {
+  return call({ command: "init", at, cowOnly, database })
 }
 
-export function create({ from = process.cwd(), name, into, copyAll, hooks, database } = {}) {
-  return call({ command: "create", from, name, into, copyAll, hooks, database })
+export function create({ from = process.cwd(), name, into, copyAll, hooks, cowOnly, database } = {}) {
+  return call({ command: "create", from, name, into, copyAll, hooks, cowOnly, database })
 }
 
 export function remove({ at = process.cwd(), all = false, hooks, database } = {}) {
@@ -68,6 +82,10 @@ export function list({ of = process.cwd(), database } = {}) {
 
 export function ancestors({ of = process.cwd(), database } = {}) {
   return call({ command: "ancestors", of, database })
+}
+
+export function doctor({ of = process.cwd(), database } = {}) {
+  return call({ command: "doctor", of, database })
 }
 
 export function gc({ database } = {}) {

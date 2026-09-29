@@ -63,6 +63,15 @@ fn supported_filesystem_cli_round_trip() {
         vec![source.clone()]
     );
 
+    let doctor = fixture.success(&source, ["doctor"]);
+    assert!(doctor.stdout.contains("instant copies"));
+    assert!(
+        fixture
+            .success(&source, [os("doctor"), os("--json")])
+            .stdout
+            .contains("backend")
+    );
+
     let external = tempfile::TempDir::new().unwrap();
     assert_different_filesystems(&source, external.path());
     let external_parent = external.path().join("external-storage");
@@ -74,10 +83,26 @@ fn supported_filesystem_cli_round_trip() {
             os("external"),
             os("--into"),
             os(external_parent.as_os_str()),
+            os("--cow-only"),
         ],
     );
     assert!(failed.stderr.contains("copy-on-write cloning unavailable"));
     assert!(!external_parent.join("external").exists());
+
+    let fallback = fixture
+        .success(
+            &source,
+            [
+                os("create"),
+                os("--name"),
+                os("external"),
+                os("--into"),
+                os(external_parent.as_os_str()),
+            ],
+        )
+        .single_stdout_path();
+    assert_eq!(fallback, external_parent.join("external"));
+    assert_workspace_copy(&fallback);
 
     let remove = fixture.success(&source, [os("remove"), os(child.as_os_str())]);
     assert!(remove.stdout.is_empty());
@@ -96,7 +121,7 @@ fn supported_filesystem_cli_round_trip() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn unsupported_filesystem_cli_fails_closed() {
+fn unsupported_filesystem_cli_falls_back_to_plain_copies() {
     if !unsupported_linux_filesystem_tests_required() {
         return;
     }
@@ -104,9 +129,15 @@ fn unsupported_filesystem_cli_fails_closed() {
     let source = fixture.root().join("source");
     create_workspace(&source);
 
+    // Strict mode preserves the old hard failure.
     let init = fixture.failure(
         fixture.root(),
-        [os("init"), os(source.as_os_str()), os("--here")],
+        [
+            os("init"),
+            os(source.as_os_str()),
+            os("--here"),
+            os("--cow-only"),
+        ],
     );
     assert!(init.stdout.is_empty());
     assert!(init.stderr.contains("copy-on-write cloning unavailable"));
@@ -115,11 +146,39 @@ fn unsupported_filesystem_cli_fails_closed() {
     assert_no_reflink_probe_files(&source);
     assert_registry_empty(fixture.database());
 
-    let create = fixture.failure(&source, ["create", "--name", "child"]);
-    assert!(create.stderr.contains("no initialized workspace found"));
-    assert!(!fixture.root().join(".rifts/source/child").exists());
-    assert!(!fixture.default_database().exists());
-    assert_registry_empty(fixture.database());
+    // Default init succeeds with a plain-copy note.
+    let init = fixture.success(
+        fixture.root(),
+        [os("init"), os(source.as_os_str()), os("--here")],
+    );
+    assert!(source.join(".rift").exists());
+    assert!(init.stderr.contains("regular copies"));
+
+    let doctor = fixture.success(&source, ["doctor"]);
+    assert!(doctor.stdout.contains("regular copies only"));
+    assert!(
+        fixture
+            .success(&source, [os("doctor"), os("--json")])
+            .stdout
+            .contains("portable")
+    );
+
+    let strict = fixture.failure(&source, ["create", "--name", "strict", "--cow-only"]);
+    assert!(strict.stderr.contains("copy-on-write cloning unavailable"));
+    assert!(!fixture.root().join(".rifts/source/strict").exists());
+
+    let child = fixture
+        .success(&source, ["create", "--name", "child"])
+        .single_stdout_path();
+    assert_eq!(child, fixture.root().join(".rifts/source/child"));
+    assert_workspace_copy(&child);
+
+    // A plain copy diverges from the source.
+    fs::write(source.join("untracked.txt"), "changed after copy").unwrap();
+    assert_eq!(
+        fs::read_to_string(child.join("untracked.txt")).unwrap(),
+        "kept"
+    );
 }
 
 #[cfg(target_os = "linux")]
