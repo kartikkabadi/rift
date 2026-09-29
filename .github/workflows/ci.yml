@@ -146,7 +146,7 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/src" -w /src rust:alpine \
             sh -c 'set -e
             apk add --no-cache musl-dev pkgconf
-            cargo build --workspace --release --locked --target x86_64-unknown-linux-musl
+            cargo build --package rift-cli --release --locked --target x86_64-unknown-linux-musl
             binary="./target/x86_64-unknown-linux-musl/release/rift"
             "$binary" doctor /src
             mkdir /tmp/ws

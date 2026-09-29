@@ -52,7 +52,7 @@ mod linux {
     use super::CowImage;
     use crate::strategy::portable::copy_directory_portable;
     use crate::{CopyMode, Error, Result};
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -84,14 +84,16 @@ mod linux {
             })?;
         let sudo = sudo_command()?;
 
-        let result = setup_image(at, name, &image, &mountpoint, filesystem, &sudo);
-        if let Err(error) = result {
-            cleanup(&image, &mountpoint, &sudo);
-            return Err(error);
-        }
-        let mut outcome = result;
-        let warnings = record_mount(&image, &mountpoint, filesystem, &sudo).err();
-        outcome.warnings.extend(warnings);
+        let mut outcome = match setup_image(at, name, &image, &mountpoint, filesystem, &sudo) {
+            Err(error) => {
+                cleanup(&image, &mountpoint, &sudo);
+                return Err(error);
+            }
+            Ok(outcome) => outcome,
+        };
+        outcome
+            .warnings
+            .extend(record_mount(&image, &mountpoint, filesystem, &sudo).err());
         Ok(outcome)
     }
 
@@ -101,7 +103,7 @@ mod linux {
         image: &Path,
         mountpoint: &Path,
         filesystem: &str,
-        sudo: &[OsStr],
+        sudo: &[OsString],
     ) -> Result<CowImage> {
         let parent = at.parent().ok_or_else(|| {
             Error::CowImageSetup(format!("workspace has no parent: {}", at.display()))
@@ -184,7 +186,7 @@ mod linux {
         image: &Path,
         mountpoint: &Path,
         filesystem: &str,
-        sudo: &[OsStr],
+        sudo: &[OsString],
     ) -> std::result::Result<(), String> {
         if mountpoint.to_string_lossy().contains(' ') || image.to_string_lossy().contains(' ') {
             return Err(format!(
@@ -218,7 +220,7 @@ mod linux {
 
     /// Deletes the image artifacts after a failed setup; the project is only
     /// renamed after the mount and copy succeed, so nothing restores it.
-    fn cleanup(image: &Path, mountpoint: &Path, sudo: &[OsStr]) {
+    fn cleanup(image: &Path, mountpoint: &Path, sudo: &[OsString]) {
         let _ = run(
             command(sudo, "umount").arg("-l").arg(mountpoint),
             "unmount the image",
@@ -231,19 +233,19 @@ mod linux {
     }
 
     /// `["sudo"]` when not already root; empty when root.
-    fn sudo_command() -> Result<Vec<OsStr>> {
+    fn sudo_command() -> Result<Vec<OsString>> {
         if unsafe { libc::geteuid() } == 0 {
             return Ok(Vec::new());
         }
         if on_path("sudo") {
-            return Ok(vec![OsStr::new("sudo").to_owned()]);
+            return Ok(vec![OsString::from("sudo")]);
         }
         Err(Error::CowImageSetup(
             "root or `sudo` is required to mount the image".into(),
         ))
     }
 
-    fn command(prefix: &[OsStr], program: &str) -> Command {
+    fn command(prefix: &[OsString], program: &str) -> Command {
         match prefix {
             [] => Command::new(program),
             [sudo] => {
@@ -262,7 +264,7 @@ mod linux {
     }
 
     fn directory_bytes(path: &Path) -> Result<u64> {
-        let mut bytes = 0;
+        let mut bytes: u64 = 0;
         for entry in walkdir::WalkDir::new(path).follow_links(false) {
             bytes = bytes.saturating_add(entry?.metadata()?.len());
         }
