@@ -1055,6 +1055,25 @@ fn git_copy_peels_symbolic_tag_heads_to_commits() {
 }
 
 #[test]
+fn diff_on_a_fresh_git_rift_is_clean() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    run(&source, &["init"]);
+    run(&source, &["config", "user.email", "test@example.com"]);
+    run(&source, &["config", "user.name", "Test"]);
+    run(&source, &["add", "file.txt"]);
+    run(&source, &["commit", "-m", "initial"]);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    // `create` detaches the rift's HEAD to a raw hash while the source keeps
+    // `ref: <branch>`; both resolve to the same commit, so the diff is clean.
+    let destination = manager.create(Create::new(source).named("git")).unwrap();
+
+    assert!(manager.diff(&destination).unwrap().is_clean());
+}
+
+#[test]
 fn create_requires_an_initialized_workspace() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);

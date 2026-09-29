@@ -214,6 +214,11 @@ struct Entry {
     modified_nanos: i64,
     mode: u32,
     link_target: Option<PathBuf>,
+    /// `.git/HEAD` resolved to its commit: `create` detaches a rift's HEAD
+    /// into the raw hash while the source keeps `ref: <branch>` — different
+    /// bytes for the same checkout. When set, it replaces the other fields'
+    /// comparison.
+    head_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -255,30 +260,62 @@ fn manifest(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as i64)
             .unwrap_or(0);
+        let head_commit = if file_type.is_file() && relative == Path::new(".git/HEAD") {
+            resolved_head_commit(root)
+        } else {
+            None
+        };
         entries.insert(
             relative.to_path_buf(),
             Entry {
                 kind,
-                size: if file_type.is_file() {
+                size: if head_commit.is_none() && file_type.is_file() {
                     metadata.len()
                 } else {
                     0
                 },
-                modified_nanos: if kind == EntryKind::File {
+                modified_nanos: if head_commit.is_none() && kind == EntryKind::File {
                     modified_nanos
                 } else {
                     0
                 },
-                mode: mode(&metadata),
+                mode: if head_commit.is_none() {
+                    mode(&metadata)
+                } else {
+                    0
+                },
                 link_target: if file_type.is_symlink() {
                     Some(fs::read_link(path)?)
                 } else {
                     None
                 },
+                head_commit,
             },
         );
     }
     Ok(entries)
+}
+
+/// The commit `.git/HEAD` points at — `hash` for a detached HEAD, or the ref
+/// it names resolved through loose refs or `packed-refs`. `None` when HEAD
+/// cannot be resolved (unborn branch, odd layout), which falls back to a
+/// plain metadata comparison.
+fn resolved_head_commit(root: &Path) -> Option<String> {
+    let head = fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ") else {
+        return Some(head.to_owned());
+    };
+    let reference = reference.trim();
+    if let Ok(hash) = fs::read_to_string(root.join(".git").join(reference)) {
+        return Some(hash.trim().to_owned());
+    }
+    fs::read_to_string(root.join(".git").join("packed-refs"))
+        .ok()?
+        .lines()
+        .find(|line| line.ends_with(&format!(" {reference}")))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
 }
 
 #[cfg(unix)]
