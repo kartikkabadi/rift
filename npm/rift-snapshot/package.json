@@ -35,6 +35,16 @@
     "arm64",
     "x64"
   ],
+  "optionalDependencies": {
+    "rift-snapshot-linux-x64": "0.0.12",
+    "rift-snapshot-linux-arm64": "0.0.12",
+    "rift-snapshot-linux-musl-x64": "0.0.12",
+    "rift-snapshot-linux-musl-arm64": "0.0.12",
+    "rift-snapshot-darwin-x64": "0.0.12",
+    "rift-snapshot-darwin-arm64": "0.0.12",
+    "rift-snapshot-windows-x64": "0.0.12",
+    "rift-snapshot-windows-arm64": "0.0.12"
+  },
   "publishConfig": {
     "provenance": true
   }

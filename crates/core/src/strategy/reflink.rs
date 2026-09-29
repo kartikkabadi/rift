@@ -1,5 +1,5 @@
 use super::{Strategy, StrategyInit, create_destination};
-use crate::{CopyMode, Error, InitProgress, Result, filter::CopyFilter};
+use crate::{Backend, CopyMode, CowMode, Error, InitProgress, Result, filter::CopyFilter};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 pub(super) struct LinuxReflinkStrategy;
 
 impl Strategy for LinuxReflinkStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, _cow: CowMode) -> Result<()> {
         let destination_parent = same_filesystem_parent(from, to)?;
         verify_reflinks_linux(destination_parent)?;
         match mode {
@@ -20,9 +20,14 @@ impl Strategy for LinuxReflinkStrategy {
         &self,
         path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         verify_reflinks_linux(path)?;
         Ok(StrategyInit::AlreadyNative)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Reflink)
     }
 }
 
@@ -138,7 +143,7 @@ pub(super) fn reflink_file_linux(from: &Path, to: &Path) -> Result<()> {
     use std::fs::{File, OpenOptions};
     use std::os::fd::AsRawFd;
 
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409;
     let source = File::open(from)?;
     let destination = OpenOptions::new().write(true).create_new(true).open(to)?;
     // SAFETY: both file descriptors come from live `File` values, and FICLONE
@@ -333,7 +338,7 @@ mod tests {
         };
         assert_eq!(
             LinuxStrategy
-                .initialize_directory(temp.path(), &mut |_| {})
+                .initialize_directory(temp.path(), &mut |_| {}, CowMode::Auto)
                 .unwrap(),
             StrategyInit::AlreadyNative
         );
@@ -359,7 +364,7 @@ mod tests {
         std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
 
         LinuxStrategy
-            .copy_directory(&source, &destination, CopyMode::All)
+            .copy_directory(&source, &destination, CopyMode::All, CowMode::Auto)
             .unwrap();
 
         assert_eq!(
@@ -397,37 +402,63 @@ mod tests {
     }
 
     #[test]
-    fn native_copy_rejects_storage_on_another_filesystem() {
+    fn copy_to_another_filesystem_requires_strict_mode_to_fail() {
         let Some(temp) = reflink_temp() else {
             return;
         };
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
         let other = TempDir::new().unwrap();
         if fs::metadata(&source).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
             return;
         }
+        let destination = other.path().join("destination");
 
         assert!(matches!(
-            LinuxStrategy.copy_directory(&source, &other.path().join("destination"), CopyMode::All),
+            LinuxStrategy.copy_directory(&source, &destination, CopyMode::All, CowMode::Require),
             Err(Error::CowUnavailable(_))
         ));
+        assert!(!destination.exists());
+
+        LinuxStrategy
+            .copy_directory(&source, &destination, CopyMode::All, CowMode::Auto)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("file.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
-    fn native_copy_rejects_empty_trees_without_reflink_support() {
+    fn copy_without_reflink_support_falls_back_unless_required() {
         let Some(temp) = non_reflink_temp() else {
             return;
         };
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
+        let strict_destination = temp.path().join("strict");
         fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
 
         assert!(matches!(
-            LinuxStrategy.copy_directory(&source, &destination, CopyMode::All),
+            LinuxStrategy.copy_directory(
+                &source,
+                &strict_destination,
+                CopyMode::All,
+                CowMode::Require
+            ),
             Err(Error::CowUnavailable(_))
         ));
-        assert!(!destination.exists());
+        assert!(!strict_destination.exists());
+
+        LinuxStrategy
+            .copy_directory(&source, &destination, CopyMode::All, CowMode::Auto)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("file.txt")).unwrap(),
+            "hello"
+        );
     }
 
     fn assert_copy_diverges_after_mutation(source: &Path, clone: &Path) {

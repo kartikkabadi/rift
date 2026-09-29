@@ -1,4 +1,6 @@
 mod config;
+pub mod cow_image;
+mod diff;
 mod filter;
 mod git;
 mod hook;
@@ -76,7 +78,16 @@ pub enum Error {
         command: String,
         message: String,
     },
+    #[error("copy-on-write image setup failed: {0}")]
+    CowImageSetup(String),
+    #[error("workspace has no parent to {operation} with: {path}")]
+    NoParent {
+        path: PathBuf,
+        operation: &'static str,
+    },
 }
+
+pub use diff::{DiffEntry, DiffKind, TreeDiff};
 
 pub struct Create {
     pub from: PathBuf,
@@ -113,6 +124,7 @@ impl Create {
 pub struct CreateOptions {
     pub copy_mode: CopyMode,
     pub hook_mode: HookMode,
+    pub cow_mode: CowMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -133,6 +145,11 @@ impl CreateOptions {
         self
     }
 
+    pub fn cow_mode(mut self, cow_mode: CowMode) -> Self {
+        self.cow_mode = cow_mode;
+        self
+    }
+
     pub fn hook_mode(mut self, hook_mode: HookMode) -> Self {
         self.hook_mode = hook_mode;
         self
@@ -149,6 +166,43 @@ impl Default for CopyMode {
     fn default() -> Self {
         Self::Filtered
     }
+}
+
+/// Whether workspace creation may fall back to a regular full copy when the
+/// filesystem offers no copy-on-write mechanism.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CowMode {
+    /// Use copy-on-write when available, otherwise a regular copy.
+    #[default]
+    Auto,
+    /// Fail with `Error::CowUnavailable` instead of falling back.
+    Require,
+}
+
+/// The copy mechanism `create` will use for a workspace path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Writable btrfs subvolume snapshots.
+    Btrfs,
+    /// Native per-file reflinks on non-btrfs Linux filesystems.
+    Reflink,
+    /// APFS `clonefile`.
+    Apfs,
+    /// ReFS block cloning on Windows.
+    #[serde(rename = "refs")]
+    ReFs,
+    /// A regular file-by-file copy; works on every filesystem.
+    Portable,
+}
+
+/// The result of probing what a path supports.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Probe {
+    pub path: PathBuf,
+    pub backend: Backend,
+    /// The filesystem type name when the platform can report it.
+    pub filesystem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,11 +233,18 @@ pub enum InitOutcome {
     Registered,
     AlreadyInitialized,
     Converted,
+    /// Registered, but the filesystem offers no copy-on-write mechanism, so
+    /// new workspaces will be regular copies unless `CowMode::Require` is set.
+    Degraded,
 }
 
 impl InitOutcome {
     pub fn is_converted(self) -> bool {
         matches!(self, Self::Converted)
+    }
+
+    pub fn is_degraded(self) -> bool {
+        matches!(self, Self::Degraded)
     }
 }
 
@@ -269,9 +330,9 @@ impl Manager {
             &source.id,
         )?;
 
-        if let Err(error) = self
-            .strategy
-            .copy_directory(&from, &destination, options.copy_mode)
+        if let Err(error) =
+            self.strategy
+                .copy_directory(&from, &destination, options.copy_mode, options.cow_mode)
         {
             if !matches!(&error, Error::AlreadyExists(path) if path == &destination)
                 && destination.exists()
@@ -284,6 +345,8 @@ impl Manager {
         let result: Result<()> = (|| {
             marker::write(&destination, &id)?;
             if git.is_repository() {
+                #[cfg(windows)]
+                git::make_writable(&destination)?;
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
             }
@@ -310,12 +373,21 @@ impl Manager {
     }
 
     pub fn init(&mut self, at: impl AsRef<Path>) -> Result<InitOutcome> {
-        self.init_with_progress(at, |_| {})
+        self.init_with_cow_mode(at, CowMode::Auto, |_| {})
     }
 
     pub fn init_with_progress(
         &mut self,
         at: impl AsRef<Path>,
+        progress: impl FnMut(InitProgress),
+    ) -> Result<InitOutcome> {
+        self.init_with_cow_mode(at, CowMode::Auto, progress)
+    }
+
+    pub fn init_with_cow_mode(
+        &mut self,
+        at: impl AsRef<Path>,
+        cow_mode: CowMode,
         mut progress: impl FnMut(InitProgress),
     ) -> Result<InitOutcome> {
         let at = existing_directory(at.as_ref())?;
@@ -327,13 +399,16 @@ impl Manager {
             } else {
                 marker::verify(&record.path, &record.id)?;
             }
-            let converted = self.strategy.initialize_directory(&at, &mut progress)?;
+            let converted = self
+                .strategy
+                .initialize_directory(&at, &mut progress, cow_mode)?;
             if git.is_repository() {
                 git::hide_marker(&at)?;
             }
             return Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::AlreadyInitialized,
                 StrategyInit::Converted => InitOutcome::Converted,
+                StrategyInit::Degraded => InitOutcome::Degraded,
             });
         }
         if marker::read(&at)?.is_some() {
@@ -347,7 +422,9 @@ impl Manager {
             return Err(Error::OverlappingWorkspace(at));
         }
 
-        let converted = self.strategy.initialize_directory(&at, &mut progress)?;
+        let converted = self
+            .strategy
+            .initialize_directory(&at, &mut progress, cow_mode)?;
         progress(InitProgress::RegisteringWorkspace);
         let id = RiftId::new();
         let result = (|| {
@@ -359,6 +436,7 @@ impl Manager {
             Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::Registered,
                 StrategyInit::Converted => InitOutcome::Converted,
+                StrategyInit::Degraded => InitOutcome::Degraded,
             })
         })();
         if result.is_err() {
@@ -615,6 +693,66 @@ impl Manager {
 
     pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(self.workspace_at(at)?.path)
+    }
+
+    /// The file-level changes inside the workspace at `at` relative to the
+    /// parent workspace it was copied from.
+    pub fn diff(&self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "compare")?;
+        diff::diff_trees(&parent.path, &record.path)
+    }
+
+    /// Applies the workspace's changes back into its parent workspace,
+    /// making the parent's files match the rift's. A rift has no three-way
+    /// merge: each differing path takes the rift's version, including the
+    /// `.git` directory (so commits made inside the rift land too).
+    pub fn land(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "land")?;
+        marker::verify(&parent.path, &parent.id)?;
+        // Landing replays `.git` file-by-file, so refuse to copy a repository
+        // that is mid-merge/rebase or lock-file'd — a torn state could land.
+        git::check_source(&record.path)?;
+        let diff = diff::diff_trees(&parent.path, &record.path)?;
+        diff::apply_diff(&diff)?;
+        Ok(diff)
+    }
+
+    /// The reverse of `land`: refreshes the rift from its parent workspace,
+    /// making the rift's files match the parent's current state.
+    pub fn sync(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "sync")?;
+        marker::verify(&parent.path, &parent.id)?;
+        git::check_source(&parent.path)?;
+        let diff = diff::diff_trees(&record.path, &parent.path)?;
+        diff::apply_diff(&diff)?;
+        Ok(diff)
+    }
+
+    fn parent(&self, record: &Record, operation: &'static str) -> Result<Record> {
+        let id = record.parent_id.clone().ok_or_else(|| Error::NoParent {
+            path: record.path.clone(),
+            operation,
+        })?;
+        self.registry
+            .record_id(&id)?
+            .ok_or_else(|| Error::NotManaged(record.path.clone()))
+    }
+
+    /// Reports which copy mechanism `create` would use for a path that exists
+    /// on disk, and the filesystem type name when the platform reports it.
+    pub fn probe(&self, at: impl AsRef<Path>) -> Result<Probe> {
+        let path = existing_directory(at.as_ref())?;
+        Ok(Probe {
+            backend: self.strategy.probe(&path)?,
+            filesystem: strategy::filesystem_name(&path),
+            path,
+        })
     }
 
     fn workspace_at(&self, path: impl AsRef<Path>) -> Result<Record> {

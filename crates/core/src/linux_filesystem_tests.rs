@@ -1,5 +1,5 @@
 use crate::test_support::linux_extents::{assert_shared_extents_when_reliable, is_btrfs_subvolume};
-use crate::{Create, Error, InitOutcome, Manager};
+use crate::{Backend, CowMode, Create, CreateOptions, Error, InitOutcome, Manager};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -71,7 +71,7 @@ fn production_supported_linux_filesystem_round_trip() {
         &[child.clone(), custom.clone()],
     );
 
-    assert_different_filesystem_storage_fails(&mut manager, &source);
+    assert_different_filesystem_storage_falls_back(&mut manager, &source);
 
     manager.remove(&grandchild).unwrap();
     assert!(!grandchild.exists());
@@ -79,17 +79,19 @@ fn production_supported_linux_filesystem_round_trip() {
 }
 
 #[test]
-fn production_unsupported_linux_filesystem_rejects_management() {
+fn production_unsupported_linux_filesystem_falls_back_to_plain_copies() {
     if std::env::var_os("RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS").is_none() {
         return;
     }
     let temp = current_filesystem_temp();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
+    fs::write(source.join("file.txt"), "hello").unwrap();
     let mut manager = Manager::open(temp.path().join("registry.sqlite")).unwrap();
 
+    // Strict mode keeps the old failure mode.
     assert!(matches!(
-        manager.init(&source),
+        manager.init_with_cow_mode(&source, CowMode::Require, |_| {}),
         Err(Error::CowUnavailable(_))
     ));
     assert!(!source.join(".rift").exists());
@@ -97,20 +99,43 @@ fn production_unsupported_linux_filesystem_rejects_management() {
     assert_reflink_probe_cleaned_up(&source);
     assert_registry_empty(&manager);
 
+    // Default init registers the workspace and reports the degraded backend.
+    assert_eq!(manager.init(&source).unwrap(), InitOutcome::Degraded);
+    assert!(source.join(".rift").exists());
+    assert_eq!(manager.probe(&source).unwrap().backend, Backend::Portable);
+
+    // Strict create still refuses; the default create makes a regular copy.
     assert!(matches!(
-        manager.create(Create {
+        manager.create_with_options(
+            Create {
+                from: source.clone(),
+                name: Some("strict".into()),
+                into: None,
+            },
+            CreateOptions::default().cow_mode(CowMode::Require),
+        ),
+        Err(Error::CowUnavailable(_))
+    ));
+    assert!(!temp.path().join(".rifts/source/strict").exists());
+
+    let child = manager
+        .create(Create {
             from: source.clone(),
-            name: Some("empty".into()),
+            name: Some("child".into()),
             into: None,
-        }),
-        Err(Error::WorkspaceNotInitialized(_))
-    ));
-    assert!(!temp.path().join(".rifts").exists());
-    assert!(matches!(
-        manager.list(&source),
-        Err(Error::WorkspaceNotInitialized(_))
-    ));
-    assert_registry_empty(&manager);
+        })
+        .unwrap();
+    assert_eq!(child, temp.path().join(".rifts/source/child"));
+    assert_eq!(fs::read_to_string(child.join("file.txt")).unwrap(), "hello");
+    assert!(child.join(".rift").exists());
+    assert_eq!(manager.list(&source).unwrap(), vec![child.clone()]);
+
+    // A plain copy diverges in both directions.
+    fs::write(source.join("file.txt"), "changed").unwrap();
+    assert_eq!(fs::read_to_string(child.join("file.txt")).unwrap(), "hello");
+
+    manager.remove(&child).unwrap();
+    assert!(!child.exists());
 }
 
 #[test]
@@ -241,21 +266,37 @@ fn assert_detached_git_copy(source: &Path, destination: &Path) {
     assert!(git_output(destination, &["status", "--porcelain", "--", ".rift"]).is_empty());
 }
 
-fn assert_different_filesystem_storage_fails(manager: &mut Manager, source: &Path) {
+fn assert_different_filesystem_storage_falls_back(manager: &mut Manager, source: &Path) {
     let other = TempDir::new().unwrap();
     if same_device(source, other.path()) {
         return;
     }
     let parent = other.path().join("storage");
     assert!(matches!(
-        manager.create(Create {
-            from: source.to_path_buf(),
-            name: Some("other-fs".into()),
-            into: Some(parent.clone()),
-        }),
+        manager.create_with_options(
+            Create {
+                from: source.to_path_buf(),
+                name: Some("other-fs".into()),
+                into: Some(parent.clone()),
+            },
+            CreateOptions::default().cow_mode(CowMode::Require),
+        ),
         Err(Error::CowUnavailable(_))
     ));
     assert!(!parent.join("other-fs").exists());
+
+    let created = manager
+        .create(Create {
+            from: source.to_path_buf(),
+            name: Some("other-fs".into()),
+            into: Some(parent.clone()),
+        })
+        .unwrap();
+    assert_eq!(created, parent.join("other-fs"));
+    assert_eq!(
+        fs::read_to_string(created.join("nested/file.txt")).unwrap(),
+        "changed"
+    );
 }
 
 fn assert_contains_exactly(mut actual: Vec<PathBuf>, expected: &[PathBuf]) {

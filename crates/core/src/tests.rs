@@ -33,6 +33,17 @@ fn create_options(copy_mode: CopyMode, hook_mode: HookMode) -> CreateOptions {
         .hook_mode(hook_mode)
 }
 
+// Hook scripts run through the platform shell; cmd's `echo` appends CRLF
+// (and keeps the space before `>>`), so compare logical lines.
+fn log_lines(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn child_path(source: &Path, name: &str) -> PathBuf {
     source.parent().unwrap().join(".rifts/app").join(name)
 }
@@ -292,14 +303,8 @@ run = "echo post >> lifecycle.log"
         .create(create_input(source.clone(), "lifecycle"))
         .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(source.join("lifecycle.log")).unwrap(),
-        "pre\n"
-    );
-    assert_eq!(
-        fs::read_to_string(child.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&source.join("lifecycle.log")), "pre");
+    assert_eq!(log_lines(&child.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
@@ -506,10 +511,7 @@ run = "echo post >> lifecycle.log"
     manager.remove(&child).unwrap();
 
     assert!(!child.exists());
-    assert_eq!(
-        fs::read_to_string(trash.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&trash.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
@@ -609,7 +611,13 @@ struct InitializingStrategy {
 }
 
 impl Strategy for InitializingStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         unreachable!()
     }
 
@@ -617,9 +625,14 @@ impl Strategy for InitializingStrategy {
         &self,
         _path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         self.initialized.set(true);
         Ok(StrategyInit::Converted)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 
@@ -1042,6 +1055,25 @@ fn git_copy_peels_symbolic_tag_heads_to_commits() {
 }
 
 #[test]
+fn diff_on_a_fresh_git_rift_is_clean() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    run(&source, &["init"]);
+    run(&source, &["config", "user.email", "test@example.com"]);
+    run(&source, &["config", "user.name", "Test"]);
+    run(&source, &["add", "file.txt"]);
+    run(&source, &["commit", "-m", "initial"]);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    // `create` detaches the rift's HEAD to a raw hash while the source keeps
+    // `ref: <branch>`; both resolve to the same commit, so the diff is clean.
+    let destination = manager.create(Create::new(source).named("git")).unwrap();
+
+    assert!(manager.diff(&destination).unwrap().is_clean());
+}
+
+#[test]
 fn create_requires_an_initialized_workspace() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
@@ -1115,21 +1147,35 @@ fn linked_git_directory_is_rejected_during_initialization() {
 struct PartialFailureStrategy;
 
 impl Strategy for PartialFailureStrategy {
-    fn copy_directory(&self, _from: &Path, to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         fs::create_dir(to)?;
         fs::write(to.join("copied-before-failure.txt"), "partial")?;
         fs::create_dir(to.join("nested"))?;
         fs::write(to.join("nested/file.txt"), "partial")?;
         Err(Error::CowUnavailable("partial failure".into()))
     }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
+    }
 }
 
 struct CollisionStrategy;
 
 impl Strategy for CollisionStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, cow: CowMode) -> Result<()> {
         fs::create_dir(to)?;
-        TestStrategy.copy_directory(from, to, mode)
+        TestStrategy.copy_directory(from, to, mode, cow)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 
@@ -1286,4 +1332,148 @@ fn run(path: &Path, args: &[&str]) {
             .unwrap()
             .success()
     );
+}
+
+fn diff_kinds(diff: &TreeDiff) -> Vec<(String, DiffKind)> {
+    diff.entries
+        .iter()
+        .map(|entry| (entry.path.to_string_lossy().replace('\\', "/"), entry.kind))
+        .collect()
+}
+
+#[test]
+fn diff_reports_added_changed_and_removed_files() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let diff = manager.diff(&child).unwrap();
+
+    let kinds = diff_kinds(&diff);
+    assert!(kinds.contains(&("new.txt".into(), DiffKind::Added)));
+    assert!(kinds.contains(&("file.txt".into(), DiffKind::Changed)));
+    assert!(!kinds.iter().any(|(path, _)| path == ".rift"));
+}
+
+#[test]
+fn diff_reports_removals_and_directory_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/deep.txt"), "deep").unwrap();
+    fs::write(source.join("gone.txt"), "bye").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::remove_dir_all(child.join("nested")).unwrap();
+    fs::remove_file(child.join("gone.txt")).unwrap();
+
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+    assert!(kinds.contains(&("nested".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("nested/deep.txt".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("gone.txt".into(), DiffKind::Removed)));
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_reports_symlink_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    std::os::unix::fs::symlink("file.txt", source.join("link.txt")).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::remove_file(child.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("other.txt", child.join("link.txt")).unwrap();
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+
+    assert!(kinds.contains(&("link.txt".into(), DiffKind::Changed)));
+
+    manager.land(&child).unwrap();
+    assert_eq!(
+        fs::read_link(source.join("link.txt")).unwrap(),
+        Path::new("other.txt")
+    );
+}
+
+#[test]
+fn land_applies_the_rifts_changes_to_the_source() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::remove_file(child.join("old.txt")).unwrap();
+    let diff = manager.land(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "edited"
+    );
+    assert_eq!(fs::read_to_string(source.join("new.txt")).unwrap(), "added");
+    assert!(!source.join("old.txt").exists());
+    assert!(manager.diff(&child).unwrap().is_clean());
+    // The rift keeps working after landing.
+    assert_eq!(diff.entries.len(), 3);
+    assert!(marker::read(&child).unwrap().is_some());
+}
+
+#[test]
+fn sync_pulls_the_sources_changes_into_the_rift() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(source.join("file.txt"), "upstream").unwrap();
+    fs::write(source.join("later.txt"), "new upstream file").unwrap();
+    let diff = manager.sync(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(child.join("file.txt")).unwrap(),
+        "upstream"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("later.txt")).unwrap(),
+        "new upstream file"
+    );
+    assert!(!diff.entries.is_empty());
+}
+
+#[test]
+fn root_workspace_has_no_parent_for_diff_land_or_sync() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    assert!(matches!(manager.diff(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.land(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.sync(&source), Err(Error::NoParent { .. })));
 }
