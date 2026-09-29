@@ -63,8 +63,8 @@ export class RiftError extends Error {
   }
 }
 
-export function init({ at = process.cwd(), cowOnly, database } = {}) {
-  return call({ command: "init", at, cowOnly, database })
+export function init({ at = process.cwd(), cowOnly, cowImage, database } = {}) {
+  return call({ command: "init", at, cowOnly, cowImage, database })
 }
 
 export function create({ from = process.cwd(), name, into, copyAll, hooks, cowOnly, database } = {}) {

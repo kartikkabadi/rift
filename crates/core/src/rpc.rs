@@ -18,6 +18,8 @@ enum Command {
         at: PathBuf,
         #[serde(rename = "cowOnly")]
         cow_only: Option<bool>,
+        #[serde(rename = "cowImage")]
+        cow_image: Option<bool>,
     },
     Create {
         from: PathBuf,
@@ -114,6 +116,7 @@ impl From<Error> for Failure {
             Error::OverlappingWorkspace(path) => ("inside_source", Some(path.clone())),
             Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
+            Error::CowImageSetup(_) => ("cow_image_setup", None),
         };
         let (hook, committed) = match &error {
             Error::HookFailed { hook, .. } => (
@@ -172,10 +175,19 @@ fn execute(input: &str) -> Result<Value, Failure> {
         .map_or_else(Manager::open_default, Manager::open)
         .map_err(Failure::from)?;
     match request.command {
-        Command::Init { at, cow_only } => manager
-            .init_with_cow_mode(at, cow_mode(cow_only), |_| {})
-            .map(|_| Value::Empty(()))
-            .map_err(Failure::from),
+        Command::Init {
+            at,
+            cow_only,
+            cow_image,
+        } => {
+            if cow_image.unwrap_or(false) {
+                crate::cow_image::setup(&at).map_err(Failure::from)?;
+            }
+            manager
+                .init_with_cow_mode(at, cow_mode(cow_only), |_| {})
+                .map(|_| Value::Empty(()))
+                .map_err(Failure::from)
+        }
         Command::Create {
             from,
             name,

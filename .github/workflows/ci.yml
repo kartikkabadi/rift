@@ -154,6 +154,27 @@ jobs:
             "$binary" create /tmp/ws --name child
             "$binary" list /tmp/ws'
 
+  cow-image-test:
+    name: Copy-on-write image end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes btrfs-progs
+
+      - name: Build rift
+        run: cargo build --package rift-cli --locked
+
+      - name: Exercise init --cow-image
+        run: bash scripts/ci/linux-cow-image.sh "${{ github.workspace }}/target/debug/rift"
+
   npm-e2e:
     name: npm package end-to-end (${{ matrix.node }})
     runs-on: ubuntu-latest

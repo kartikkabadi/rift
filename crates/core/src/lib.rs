@@ -1,4 +1,5 @@
 mod config;
+pub mod cow_image;
 mod filter;
 mod git;
 mod hook;
@@ -76,6 +77,8 @@ pub enum Error {
         command: String,
         message: String,
     },
+    #[error("copy-on-write image setup failed: {0}")]
+    CowImageSetup(String),
 }
 
 pub struct Create {

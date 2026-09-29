@@ -136,6 +136,11 @@ enum Command {
         /// cannot copy-on-write.
         #[arg(long)]
         cow_only: bool,
+        /// Linux only: when the filesystem cannot copy-on-write, create and
+        /// mount a fast virtual disk next to the workspace and move the
+        /// workspace into it. Requires root or sudo.
+        #[arg(long)]
+        cow_image: bool,
     },
     Create {
         from: Option<PathBuf>,
@@ -237,9 +242,36 @@ fn run() -> Result<()> {
             print_shell_init(shell);
             Ok(())
         }
-        Command::Init { at, here, cow_only } => {
+        Command::Init {
+            at,
+            here,
+            cow_only,
+            cow_image,
+        } => {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
+            if cow_image && existing.is_none() {
+                match rift::cow_image::setup(&at)? {
+                    Some(image) => {
+                        eprintln!(
+                            "set up a {} virtual disk at {}; workspace moved to {}",
+                            image.filesystem,
+                            image.image.display(),
+                            image.project.display()
+                        );
+                        eprintln!(
+                            "the original was kept at {}; delete it once verified",
+                            image.backup.display()
+                        );
+                        for warning in &image.warnings {
+                            eprintln!("note: {warning}");
+                        }
+                    }
+                    None => eprintln!(
+                        "this filesystem already supports instant copies; --cow-image skipped"
+                    ),
+                }
+            }
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
             let mut converting = false;
             let outcome =
@@ -426,6 +458,11 @@ fn run() -> Result<()> {
                 println!("copy method: {method}");
                 if matches!(probe.backend, Backend::Portable) {
                     println!("tip: `rift init` still works; new rifts will just take longer");
+                    if cfg!(target_os = "linux") {
+                        println!(
+                            "tip: on Linux, `rift init --cow-image` sets up a fast virtual disk for instant copies (needs root)"
+                        );
+                    }
                 }
             }
             Ok(())
@@ -575,7 +612,8 @@ mod tests {
 
     #[test]
     fn init_and_doctor_accept_strict_and_json_flags() {
-        let init = Cli::try_parse_from(["rift", "init", "--here", "--cow-only"]).unwrap();
+        let init =
+            Cli::try_parse_from(["rift", "init", "--here", "--cow-only", "--cow-image"]).unwrap();
         let doctor = Cli::try_parse_from(["rift", "doctor", "--json"]).unwrap();
 
         assert!(matches!(
@@ -583,6 +621,7 @@ mod tests {
             Command::Init {
                 here: true,
                 cow_only: true,
+                cow_image: true,
                 ..
             }
         ));

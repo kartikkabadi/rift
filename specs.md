@@ -19,6 +19,7 @@ init(input: {
 
 - On Linux, `at` uses btrfs or native reflinks when available; on other supported systems, initialization registers the workspace without filesystem conversion.
 - When no instant-copy backend applies to `at`, `init` registers the workspace anyway and reports that future `create` calls will be regular copies. The `--cow-only` flag turns this into a hard failure for callers that require instant copies.
+- On Linux, `init --cow-image` (API `cowImage`) is an opt-in upgrade for unsupported filesystems: it creates a sparse image file beside the workspace under `.rifts-images/`, formats it btrfs/xfs/f2fs (whichever `mkfs` tool is installed), loop-mounts it, copies the workspace into `<mount>/workspaces/<name>`, renames the original to `<name>.rift-backup`, and replaces the original path with a symlink into the image. Canonical path recording then places both the workspace and its `.rifts` storage on the image, so `create` gets instant copies with no other changes. It requires root or `sudo` and is a no-op when the filesystem already clones instantly.
 - If `at` is already a btrfs subvolume, register it without replacing it.
 - If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume and atomically replace the original directory at its existing path.
 - On other Linux filesystems, verify native reflink support and register `at` without replacing it; when reflinks are unavailable, register `at` in regular-copy mode.

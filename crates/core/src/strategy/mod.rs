@@ -11,7 +11,7 @@ mod apfs;
 mod btrfs;
 #[cfg(target_os = "linux")]
 mod linux;
-mod portable;
+pub(crate) mod portable;
 #[cfg(target_os = "linux")]
 mod reflink;
 #[cfg(target_os = "windows")]

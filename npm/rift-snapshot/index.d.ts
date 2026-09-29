@@ -9,6 +9,8 @@ export interface AtOptions extends Options {
 export interface InitOptions extends AtOptions {
   /** Fail instead of falling back to a regular copy when the filesystem cannot clone instantly. */
   cowOnly?: boolean
+  /** Linux only: set up a fast virtual disk so copies become instant even on filesystems without copy-on-write. Requires root or sudo. */
+  cowImage?: boolean
 }
 
 export interface CreateOptions extends Options {
@@ -36,6 +38,7 @@ export type RiftErrorCode =
   | "walk"
   | "invalid_path"
   | "cow_unavailable"
+  | "cow_image_setup"
   | "initialization_required"
   | "workspace_not_initialized"
   | "missing_marker"

@@ -106,10 +106,18 @@ After `rift init` in the project root, OpenCode's workspace UI creates Rift work
 ```bash
 rift init
 rift init --here
+rift init --cow-image   # Linux only
 ```
 
 Selects an existing Rift root above the current directory, or the nearest Git root when no Rift root exists. `--here`
 initializes exactly the selected directory. If a registered root lost its `.rift` marker, `init` restores it.
+
+On Linux, `--cow-image` upgrades filesystems without instant copies (ext4, tmpfs, NFS, and so on) to instant copies:
+it creates a sparse disk image next to the workspace, formats it btrfs (or xfs/f2fs when btrfs tools are missing),
+loop-mounts it, moves the workspace into it, and links the original path to the moved copy. Requires root or `sudo`
+and `mkfs.btrfs`, `mkfs.xfs`, or `mkfs.f2fs`. The original directory is kept as `<name>.rift-backup`; delete it once
+verified. The mount is recorded in `/etc/fstab` so it survives reboots — remove the line and the `.rifts-images`
+directory to undo. The flag is a no-op on filesystems that already clone instantly and errors on other platforms.
 
 ### `rift create`
 
@@ -166,14 +174,15 @@ keeps the source directory, removes its `.rift` marker, and trashes registered d
 
 | Platform             | Instant-copy backend          | Fallback                                                       |
 | -------------------- | ------------------------------ | -------------------------------------------------------------- |
-| Linux x64 / arm64    | btrfs snapshots, or reflinks   | Regular copy on ext4, tmpfs, NFS, and other filesystems          |
+| Linux x64 / arm64    | btrfs snapshots, or reflinks   | Regular copy, or `init --cow-image` for a fast virtual disk    |
 | macOS arm64 / x64    | APFS `clonefile`               | Regular copy on exFAT, FAT32, network volumes, etc.              |
 | Windows x64 / arm64  | ReFS block cloning (Dev Drive) | Regular copy on NTFS and other filesystems                       |
 
 `rift init` works on every filesystem: it picks the instant-copy backend when one exists and otherwise registers the
-workspace for regular copies with a note. `--cow-only` requires an instant-copy backend and fails instead. Release
-archives and npm prebuilds cover Linux glibc and musl (any distro, including Alpine), macOS, and Windows on x64 and
-arm64.
+workspace for regular copies with a note. `--cow-only` requires an instant-copy backend and fails instead. On Linux,
+`--cow-image` instead mounts a small btrfs/xfs/f2fs virtual disk next to the workspace and relocates it there, so even
+ext4 hosts get instant copies. Release archives and npm prebuilds cover Linux glibc and musl (any distro, including
+Alpine), macOS, and Windows on x64 and arm64.
 
 Each managed workspace has a `.rift` marker containing its ID. A SQLite registry stores paths, parents, and trash
 entries. Default storage is adjacent to the source root:
