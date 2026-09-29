@@ -25,8 +25,8 @@ const binaryPath = path.join(directory, platform === "windows" ? "rift.exe" : "r
 async function loadFfi(libraryPath) {
   const { dlopen, toString } = await import("node:ffi")
   const { functions } = dlopen(libraryPath, {
-    rift_ffi_call: { parameters: ["string"], result: "pointer" },
-    rift_ffi_free: { parameters: ["pointer"], result: "void" },
+    rift_ffi_call: { arguments: ["cstring"], return: "pointer" },
+    rift_ffi_free: { arguments: ["pointer"], return: "void" },
   })
   return (request) => {
     const output = functions.rift_ffi_call(JSON.stringify(request))
