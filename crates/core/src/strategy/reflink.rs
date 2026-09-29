@@ -143,7 +143,7 @@ pub(super) fn reflink_file_linux(from: &Path, to: &Path) -> Result<()> {
     use std::fs::{File, OpenOptions};
     use std::os::fd::AsRawFd;
 
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409;
     let source = File::open(from)?;
     let destination = OpenOptions::new().write(true).create_new(true).open(to)?;
     // SAFETY: both file descriptors come from live `File` values, and FICLONE

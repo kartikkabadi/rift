@@ -142,8 +142,9 @@ fn statfs(path: &Path) -> Result<libc::statfs> {
 }
 
 pub(super) fn filesystem(path: &Path) -> Result<Filesystem> {
-    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683e;
-    Ok(match statfs(path)?.f_type {
+    // `statfs.f_type` is `c_long` on glibc and `u64` on musl.
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    Ok(match statfs(path)?.f_type as u64 {
         BTRFS_SUPER_MAGIC => Filesystem::Btrfs,
         _ => Filesystem::Other,
     })
@@ -152,7 +153,7 @@ pub(super) fn filesystem(path: &Path) -> Result<Filesystem> {
 /// The kernel's filesystem type magic mapped to a name where one is common.
 /// Unknown magics surface as a hex value rather than failing.
 pub(super) fn filesystem_name(path: &Path) -> Option<String> {
-    const MAGIC_NAMES: &[(libc::c_long, &str)] = &[
+    const MAGIC_NAMES: &[(u64, &str)] = &[
         (0x9123_683e, "btrfs"),
         (0x5846_5342, "xfs"),
         (0xef53, "ext"),
@@ -174,12 +175,12 @@ pub(super) fn filesystem_name(path: &Path) -> Option<String> {
         (0x9fa0, "proc"),
         (0x6265_6572, "sysfs"),
     ];
-    let stat = statfs(path).ok()?;
+    let f_type = statfs(path).ok()?.f_type as u64;
     Some(
         MAGIC_NAMES
             .iter()
-            .find(|(magic, _)| *magic == stat.f_type)
+            .find(|(magic, _)| *magic == f_type)
             .map(|(_, name)| (*name).to_owned())
-            .unwrap_or_else(|| format!("magic-0x{:x}", stat.f_type)),
+            .unwrap_or_else(|| format!("magic-0x{f_type:x}")),
     )
 }

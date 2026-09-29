@@ -191,11 +191,11 @@ fn remove_emptyable_subvolume(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SNAP_CREATE: libc::c_ulong = 0x5000_9401;
+const BTRFS_IOC_SNAP_CREATE: libc::Ioctl = 0x5000_9401;
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
+const BTRFS_IOC_SUBVOL_CREATE: libc::Ioctl = 0x5000_940e;
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SNAP_DESTROY: libc::c_ulong = 0x5000_940f;
+const BTRFS_IOC_SNAP_DESTROY: libc::Ioctl = 0x5000_940f;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -207,7 +207,7 @@ struct BtrfsIoctlVolArgs {
 #[cfg(target_os = "linux")]
 fn btrfs_path_ioctl(
     path: &Path,
-    request: libc::c_ulong,
+    request: libc::Ioctl,
     source_fd: Option<libc::c_int>,
     action: &str,
 ) -> Result<()> {
