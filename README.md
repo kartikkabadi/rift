@@ -113,9 +113,9 @@ Selects an existing Rift root above the current directory, or the nearest Git ro
 initializes exactly the selected directory. If a registered root lost its `.rift` marker, `init` restores it.
 
 On Linux, `--cow-image` upgrades filesystems without instant copies (ext4, tmpfs, NFS, and so on) to instant copies:
-it creates a sparse disk image next to the workspace, formats it btrfs (or xfs/f2fs when btrfs tools are missing),
+it creates a sparse disk image next to the workspace, formats it btrfs (or xfs when btrfs tools are missing),
 loop-mounts it, moves the workspace into it, and links the original path to the moved copy. Requires root or `sudo`
-and `mkfs.btrfs`, `mkfs.xfs`, or `mkfs.f2fs`. The original directory is kept as `<name>.rift-backup`; delete it once
+and `mkfs.btrfs` or `mkfs.xfs`. The original directory is kept as `<name>.rift-backup`; delete it once
 verified. The mount is recorded in `/etc/fstab` so it survives reboots — remove the line and the `.rifts-images`
 directory to undo. The flag is a no-op on filesystems that already clone instantly and errors on other platforms.
 
@@ -180,7 +180,7 @@ keeps the source directory, removes its `.rift` marker, and trashes registered d
 
 `rift init` works on every filesystem: it picks the instant-copy backend when one exists and otherwise registers the
 workspace for regular copies with a note. `--cow-only` requires an instant-copy backend and fails instead. On Linux,
-`--cow-image` instead mounts a small btrfs/xfs/f2fs virtual disk next to the workspace and relocates it there, so even
+`--cow-image` instead mounts a small btrfs/xfs virtual disk next to the workspace and relocates it there, so even
 ext4 hosts get instant copies. Release archives and npm prebuilds cover Linux glibc and musl (any distro, including
 Alpine), macOS, and Windows on x64 and arm64.
 

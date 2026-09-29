@@ -296,10 +296,10 @@ assert_capability_probe() {
     btrfs)
       assert_btrfs_subvolume_probe
       ;;
-    xfs-reflink | zfs | f2fs)
+    xfs-reflink | zfs)
       assert_reflink_probe_passes
       ;;
-    xfs-no-reflink | ext4 | tmpfs)
+    xfs-no-reflink | ext4 | tmpfs | f2fs)
       assert_reflink_probe_fails
       ;;
   esac

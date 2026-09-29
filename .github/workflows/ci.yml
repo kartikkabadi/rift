@@ -74,7 +74,7 @@ jobs:
             required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
           - filesystem: f2fs
             packages: f2fs-tools
-            required_env: RIFT_REQUIRE_REFLINK_TESTS
+            required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

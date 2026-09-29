@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercises `rift init --cow-image` end to end on a filesystem that cannot
 # copy-on-write. Run on a Linux host with passwordless sudo and a filesystem
-# tool installed (btrfs-progs, xfsprogs, or f2fs-tools).
+# tool installed (btrfs-progs or xfsprogs).
 set -euo pipefail
 
 rift="${1:?usage: linux-cow-image.sh <path-to-rift-binary>}"
@@ -28,7 +28,7 @@ host_fstype="$(findmnt -T "${project}" -n -o FSTYPE)"
 echo "host filesystem: ${host_fstype}"
 "${rift}" doctor "${project}"
 case "${host_fstype}" in
-  btrfs | xfs | f2fs | zfs | bcachefs)
+  btrfs | xfs | zfs | bcachefs)
     fail "host filesystem already supports instant copies; nothing to prove"
     ;;
 esac
@@ -40,7 +40,7 @@ section "post-init state"
 [[ -L "${project}" ]] || fail "${project} is not a symlink after cow-image setup"
 real="$(readlink -f "${project}")"
 echo "workspace resolves to ${real}"
-[[ "$(findmnt -T "${real}" -n -o FSTYPE)" =~ ^(btrfs|xfs|f2fs)$ ]] ||
+[[ "$(findmnt -T "${real}" -n -o FSTYPE)" =~ ^(btrfs|xfs)$ ]] ||
   fail "mounted workspace is not on a copy-on-write filesystem: $(findmnt -T "${real}" -n -o FSTYPE)"
 [[ -d "${work}/app.rift-backup" ]] || fail "backup directory missing"
 [[ "$(cat "${real}/nested/file.txt")" == "hello" ]] || fail "workspace content lost"

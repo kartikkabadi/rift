@@ -1,8 +1,8 @@
 //! Optional copy-on-write disk image for filesystems without one.
 //!
 //! On Linux, `rift init --cow-image` creates a sparse image file on the host
-//! filesystem, formats it with a filesystem that supports fast clones (btrfs,
-//! xfs, or f2fs), mounts it at a hidden directory next to the project, moves
+//! filesystem, formats it with a filesystem that supports fast clones (btrfs
+//! or xfs), mounts it at a hidden directory next to the project, moves
 //! the project inside, and leaves the original path working as a symlink.
 //! Because rift records canonical paths, every later `rift create` lands its
 //! source and destination on the image and gets instant copies.
@@ -57,8 +57,8 @@ mod linux {
     use std::process::Command;
 
     /// Filesystems that can carry fast clones, in preference order: btrfs gets
-    /// subvolume snapshots, xfs and f2fs get reflinks.
-    const FILESYSTEMS: &[&str] = &["btrfs", "xfs", "f2fs"];
+    /// subvolume snapshots, xfs gets reflinks.
+    const FILESYSTEMS: &[&str] = &["btrfs", "xfs"];
 
     pub(super) fn setup(at: &Path) -> Result<CowImage> {
         let name = at.file_name().ok_or_else(|| {
@@ -79,7 +79,7 @@ mod linux {
             .find(|fs| on_path(&format!("mkfs.{fs}")))
             .ok_or_else(|| {
                 Error::CowImageSetup(
-                    "no mkfs tool found; install btrfs-progs, xfsprogs, or f2fs-tools".into(),
+                    "no mkfs tool found; install btrfs-progs or xfsprogs".into(),
                 )
             })?;
         let sudo = sudo_command()?;
