@@ -130,6 +130,17 @@ mod linux {
                 .arg(mountpoint),
             &format!("mount {}", mountpoint.display()),
         )?;
+        if !sudo.is_empty() {
+            let owner = format!(
+                "{}:{}",
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() }
+            );
+            run(
+                command(sudo, "chown").arg(owner).arg(mountpoint),
+                "hand the mount to the current user",
+            )?;
+        }
         let moved = mountpoint.join("workspaces").join(name);
         std::fs::create_dir_all(mountpoint.join("workspaces"))?;
         copy_directory_portable(at, &moved, CopyMode::All)?;

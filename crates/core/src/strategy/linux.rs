@@ -70,10 +70,15 @@ impl Strategy for LinuxStrategy {
     }
 }
 
+// Comparing `f_fsid`, not `st_dev`: on btrfs every subvolume reports its own
+// anonymous st_dev, so an initialized workspace (a subvolume) and the `.rifts`
+// storage beside it look like different filesystems even though snapshots
+// between them are legal. `f_fsid` identifies the mounted filesystem itself —
+// identical across its subvolumes and different across separate mounts. libc
+// keeps `fsid_t`'s fields private, so compare through its derived Debug.
 fn same_filesystem(from: &Path, destination_parent: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    Ok(fs::metadata(from)?.dev() == fs::metadata(destination_parent)?.dev())
+    Ok(format!("{:?}", statfs(from)?.f_fsid)
+        == format!("{:?}", statfs(destination_parent)?.f_fsid))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

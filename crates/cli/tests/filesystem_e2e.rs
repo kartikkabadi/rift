@@ -109,7 +109,7 @@ fn supported_filesystem_cli_round_trip() {
     assert!(!child.exists());
     assert_eq!(
         fixture.success(&source, ["list"]).stdout_paths(),
-        vec![custom.clone()]
+        vec![custom.clone(), fallback.clone()]
     );
 
     let removed = fixture.success(&source, ["gc"]).stdout_paths();
