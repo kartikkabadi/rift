@@ -102,9 +102,12 @@ pub(crate) fn make_writable(path: &Path) -> Result<()> {
     if !git.is_dir() {
         return Ok(());
     }
+    // Objects stay read-only: they are immutable and never modified in place,
+    // so keeping Git's read-only convention also keeps `diff` honest.
+    let objects = git.join("objects");
     for entry in walkdir::WalkDir::new(&git).min_depth(1) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() || entry.path().starts_with(&objects) {
             continue;
         }
         let mut permissions = entry.metadata()?.permissions();
