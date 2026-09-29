@@ -149,6 +149,7 @@ create_mount() {
       ;;
     f2fs)
       format_loopback 1G mkfs.f2fs -f
+      sudo modprobe f2fs || true
       mount_loopback
       ;;
     zfs)
@@ -295,7 +296,7 @@ assert_capability_probe() {
     btrfs)
       assert_btrfs_subvolume_probe
       ;;
-    xfs-reflink | zfs)
+    xfs-reflink | zfs | f2fs)
       assert_reflink_probe_passes
       ;;
     xfs-no-reflink | ext4 | tmpfs)
