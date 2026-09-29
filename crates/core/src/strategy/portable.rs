@@ -183,7 +183,7 @@ fn create_symlink_at(target: &Path, _source: &Path, destination: &Path) -> Resul
 
 #[cfg(windows)]
 fn create_symlink_at(target: &Path, source: &Path, destination: &Path) -> Result<()> {
-    let directory = fs::metadata(source).map_or(false, |m| m.is_dir());
+    let directory = fs::metadata(source).is_ok_and(|m| m.is_dir());
     let result = if directory {
         std::os::windows::fs::symlink_dir(target, destination)
     } else {

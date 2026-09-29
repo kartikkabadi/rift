@@ -93,6 +93,30 @@ pub(crate) fn detach_destination(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Clears the read-only bit on files under `.git`. Windows refuses to modify
+/// read-only files, and a plain copy preserves the attributes Git sets on its
+/// objects, which would block the post-copy fixup and later `git` commands.
+#[cfg(windows)]
+pub(crate) fn make_writable(path: &Path) -> Result<()> {
+    let git = path.join(".git");
+    if !git.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(&git).min_depth(1) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let mut permissions = entry.metadata()?.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(entry.path(), permissions)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_head_commit(path: &Path) -> Option<git2::Oid> {
     let repository = git2::Repository::open(path).ok()?;

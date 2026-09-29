@@ -345,6 +345,8 @@ impl Manager {
         let result: Result<()> = (|| {
             marker::write(&destination, &id)?;
             if git.is_repository() {
+                #[cfg(windows)]
+                git::make_writable(&destination)?;
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
             }
