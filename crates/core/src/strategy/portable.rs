@@ -224,9 +224,20 @@ pub(crate) fn copy_metadata(from: &Path, to: &Path, target: MetadataTarget) -> R
     let metadata = fs::symlink_metadata(from)?;
     copy_ownership_portable(from, to);
     copy_xattrs_portable(from, to);
-    // Timestamps go on before permissions: on Windows, setting the times of
-    // a read-only file (common under `.git`) fails once the read-only bit is
-    // applied, so permissions always come last.
+    // Timestamps go on before permissions: `fs::copy` on Windows clones the
+    // read-only attribute (common under `.git`), and a read-only destination
+    // refuses new timestamps, so the bit is cleared first and the real
+    // permissions applied last.
+    if matches!(target, MetadataTarget::FileOrDirectory)
+        && let Ok(existing) = fs::metadata(to)
+    {
+        let mut permissions = existing.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(to, permissions)?;
+        }
+    }
     copy_file_times(&metadata, to, target)?;
     if matches!(target, MetadataTarget::FileOrDirectory) {
         fs::set_permissions(to, metadata.permissions())?;
