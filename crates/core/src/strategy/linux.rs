@@ -15,18 +15,10 @@ impl Strategy for LinuxStrategy {
         let destination_parent = to
             .parent()
             .ok_or_else(|| Error::Path(format!("destination has no parent: {}", to.display())))?;
-        let fs = filesystem(from)?;
-        let same = same_filesystem(from, destination_parent)?;
-        eprintln!(
-            "[copy-dispatch] from={} fs={fs:?} same={same} dest_parent={} ftype={:#x} fsid={:?} | dst ftype={:#x} fsid={:?}",
-            from.display(),
-            destination_parent.display(),
-            statfs(from)?.f_type,
-            statfs(from)?.f_fsid,
-            statfs(destination_parent)?.f_type,
-            statfs(destination_parent)?.f_fsid,
-        );
-        match (fs, same) {
+        match (
+            filesystem(from)?,
+            same_filesystem(from, destination_parent)?,
+        ) {
             (Filesystem::Btrfs, true) => BtrfsStrategy.copy_directory(from, to, mode, cow),
             (Filesystem::Other, true) => match verify_reflinks_linux(destination_parent) {
                 Ok(()) => LinuxReflinkStrategy.copy_directory(from, to, mode, cow),
@@ -78,15 +70,53 @@ impl Strategy for LinuxStrategy {
     }
 }
 
-// Comparing `f_fsid`, not `st_dev`: on btrfs every subvolume reports its own
-// anonymous st_dev, so an initialized workspace (a subvolume) and the `.rifts`
-// storage beside it look like different filesystems even though snapshots
-// between them are legal. `f_fsid` identifies the mounted filesystem itself —
-// identical across its subvolumes and different across separate mounts. libc
-// keeps `fsid_t`'s fields private, so compare through its derived Debug.
+// Whether two paths live on the same mounted filesystem, identified by the
+// mount's `major:minor` device in /proc/self/mountinfo — the superblock's
+// device number. Neither `st_dev` nor `f_fsid` can identify it on btrfs: each
+// subvolume mints its own anonymous values for both, so an initialized
+// workspace (a subvolume) and the `.rifts` storage beside it look foreign to
+// each other even though snapshots between them are legal. Every subvolume
+// and bind mount of one filesystem shares this device number.
 fn same_filesystem(from: &Path, destination_parent: &Path) -> Result<bool> {
-    Ok(format!("{:?}", statfs(from)?.f_fsid)
-        == format!("{:?}", statfs(destination_parent)?.f_fsid))
+    Ok(mount_device(from)? == mount_device(destination_parent)?)
+}
+
+fn mount_device(path: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(path)?;
+    let mut longest = 0usize;
+    let mut device = None;
+    for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        // id parent_id major:minor root mount_point options - fstype ...
+        let mut fields = line.split(' ');
+        let (Some(_id), Some(_parent), Some(dev), Some(_root), Some(point)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let point = unescape_mount_point(point);
+        if canonical.starts_with(Path::new(&point)) && point.len() > longest {
+            longest = point.len();
+            device = Some(dev.to_string());
+        }
+    }
+    device.ok_or_else(|| {
+        Error::Path(format!(
+            "no mount table entry contains {}",
+            canonical.display()
+        ))
+    })
+}
+
+fn unescape_mount_point(escaped: &str) -> String {
+    escaped
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
