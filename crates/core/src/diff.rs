@@ -104,6 +104,16 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
             }
             directories.insert(destination.clone());
         } else if file_type.is_file() {
+            // Overwriting a read-only destination (common under `.git`)
+            // fails on Windows, so clear the bit first.
+            if let Ok(existing) = fs::symlink_metadata(&destination) {
+                let mut permissions = existing.permissions();
+                if permissions.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    permissions.set_readonly(false);
+                    fs::set_permissions(&destination, permissions)?;
+                }
+            }
             fs::copy(&source, &destination)?;
             portable::copy_metadata(
                 &source,

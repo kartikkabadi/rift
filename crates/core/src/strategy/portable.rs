@@ -224,10 +224,14 @@ pub(crate) fn copy_metadata(from: &Path, to: &Path, target: MetadataTarget) -> R
     let metadata = fs::symlink_metadata(from)?;
     copy_ownership_portable(from, to);
     copy_xattrs_portable(from, to);
+    // Timestamps go on before permissions: on Windows, setting the times of
+    // a read-only file (common under `.git`) fails once the read-only bit is
+    // applied, so permissions always come last.
+    copy_file_times(&metadata, to, target)?;
     if matches!(target, MetadataTarget::FileOrDirectory) {
         fs::set_permissions(to, metadata.permissions())?;
     }
-    copy_file_times(&metadata, to, target)
+    Ok(())
 }
 
 fn copy_file_times(metadata: &fs::Metadata, to: &Path, target: MetadataTarget) -> Result<()> {
