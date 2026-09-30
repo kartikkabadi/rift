@@ -916,3 +916,37 @@ fn case_only_rename_over_an_ours_edit_holds_and_force_absorbs_the_slot() {
         "theirs-edit"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn land_skips_removals_made_vacuous_by_a_theirs_side_symlink() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel.txt"), "untouched").unwrap();
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/x.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The rift replaces the directory with a symlink pointing outside the
+    // workspace. Applying it removes ours' real `d`, which makes the
+    // plan's clean `d/x.txt` removal vacuous — it must be skipped, not
+    // error halfway through the apply, and never delete through the link.
+    fs::remove_dir_all(child.join("d")).unwrap();
+    std::os::unix::fs::symlink(&outside, child.join("d")).unwrap();
+
+    manager.land(&child).unwrap();
+    assert_eq!(fs::read_link(source.join("d")).unwrap(), outside.as_path());
+    assert!(!outside.join("x.txt").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("sentinel.txt")).unwrap(),
+        "untouched"
+    );
+    // The retry is a clean no-op: nothing is left half-applied.
+    let retry = manager.land(&child).unwrap();
+    assert!(retry.applied.is_clean());
+    assert!(retry.conflicts.is_empty());
+}

@@ -117,15 +117,22 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
     for entry in &diff.entries {
         let source = diff.to.join(&entry.path);
         let destination = diff.from.join(&entry.path);
+        if entry.kind == DiffKind::Removed {
+            // The plan exempts removals from the container check because an
+            // earlier entry can make them vacuous mid-apply: a directory
+            // this same apply replaced by a symlink would resolve the
+            // removal outside the workspace. Skip it rather than error or
+            // delete through the link.
+            if symlinked_ancestor(&diff.from, &destination)?.is_none() {
+                remove_path(&destination)?;
+            }
+            continue;
+        }
         // The merge plan already refuses writes under a container `ours`
         // broke; this check is the enforcement at the write boundary so a
         // symlinked directory inside the destination can never redirect an
-        // entry (or a removal) outside the workspace root.
+        // entry outside the workspace root.
         check_container_chain(&diff.from, &destination)?;
-        if entry.kind == DiffKind::Removed {
-            remove_path(&destination)?;
-            continue;
-        }
         let metadata = fs::symlink_metadata(&source)?;
         let file_type = metadata.file_type();
         let existing = fs::symlink_metadata(&destination)
@@ -197,12 +204,26 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
     Ok(())
 }
 
-/// Rejects a write or removal whose destination chain contains a symlink:
-/// `fs::copy` and `fs::remove_*` follow intermediate components, so a
-/// directory replaced by a symlink inside the destination root would send
-/// the operation outside the workspace. A missing ancestor is left to the
-/// operation itself to report.
+/// Rejects a write whose destination chain contains a symlink: `fs::copy`
+/// and friends follow intermediate components, so a directory replaced by
+/// a symlink inside the destination root would send the operation outside
+/// the workspace. A missing ancestor is left to the operation itself to
+/// report.
 fn check_container_chain(root: &Path, destination: &Path) -> Result<()> {
+    if let Some(directory) = symlinked_ancestor(root, destination)? {
+        return Err(Error::Path(format!(
+            "refusing to operate through symlinked directory: {}",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The nearest ancestor of `destination` inside `root` that is a symlink,
+/// if any. Path-based operations follow intermediate links, so a
+/// symlinked directory in the chain would redirect the operation outside
+/// the workspace root.
+fn symlinked_ancestor(root: &Path, destination: &Path) -> Result<Option<PathBuf>> {
     for directory in destination
         .ancestors()
         .skip(1)
@@ -210,17 +231,14 @@ fn check_container_chain(root: &Path, destination: &Path) -> Result<()> {
     {
         match fs::symlink_metadata(directory) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::Path(format!(
-                    "refusing to operate through symlinked directory: {}",
-                    directory.display()
-                )));
+                return Ok(Some(directory.to_path_buf()));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// On a case-folding volume `destination` can resolve to an entry stored
