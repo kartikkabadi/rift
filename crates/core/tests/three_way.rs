@@ -348,6 +348,175 @@ fn unicode_names_empty_directories_and_binary_files_land() {
     assert!(!source.join("file.txt").exists());
 }
 
+#[test]
+fn land_conflicts_instead_of_writing_into_a_deleted_directory() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The parent deletes the whole directory; the fork adds a file inside
+    // it. That is a delete-vs-modify conflict, not a clean add into a
+    // missing parent.
+    fs::remove_dir_all(source.join("d")).unwrap();
+    fs::write(child.join("d/new.txt"), "new").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/new.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!source.join("d").exists());
+
+    // A retry reports the same conflict instead of failing identically.
+    let retry = manager.land(&child).unwrap();
+    assert!(
+        retry
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/new.txt"))
+    );
+}
+
+#[test]
+fn sync_conflicts_instead_of_writing_into_a_deleted_directory() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The rift deletes the directory; the parent adds a file inside it.
+    fs::remove_dir_all(child.join("d")).unwrap();
+    fs::write(source.join("d/new.txt"), "new").unwrap();
+
+    let outcome = manager.sync(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/new.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!child.join("d").exists());
+    assert_eq!(fs::read_to_string(source.join("d/new.txt")).unwrap(), "new");
+}
+
+#[test]
+fn land_conflicts_when_the_parent_turned_the_directory_into_a_file() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The parent replaces `d` with a plain file; the fork adds inside it.
+    fs::remove_dir_all(source.join("d")).unwrap();
+    fs::write(source.join("d"), "a file").unwrap();
+    fs::write(child.join("d/new.txt"), "new").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/new.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(fs::read_to_string(source.join("d")).unwrap(), "a file");
+}
+
+#[test]
+fn land_still_applies_into_a_directory_with_a_mode_change() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("e")).unwrap();
+    fs::write(source.join("e/old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // A mode-only change to the container is not a broken chain: the
+    // incoming add lands in the real directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(source.join("e"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(child.join("e/new.txt"), "new").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(fs::read_to_string(source.join("e/new.txt")).unwrap(), "new");
+}
+
+#[cfg(unix)]
+#[test]
+fn land_never_writes_through_a_symlinked_directory() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let victim = temp.path().join("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::write(victim.join("sentinel.txt"), "untouched").unwrap();
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The parent replaced `d` with a symlink outside the workspace; the
+    // fork added a file under `d`. The write must not follow the link.
+    fs::remove_dir_all(source.join("d")).unwrap();
+    std::os::unix::fs::symlink(&victim, source.join("d")).unwrap();
+    fs::write(child.join("d/evil.txt"), "pwned").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/evil.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!victim.join("evil.txt").exists());
+    assert_eq!(
+        fs::read_to_string(victim.join("sentinel.txt")).unwrap(),
+        "untouched"
+    );
+    assert_eq!(fs::read_link(source.join("d")).unwrap(), victim.as_path());
+
+    // Force resolves the conflict by restoring a real directory — it must
+    // not write through the link either.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert!(!victim.join("evil.txt").exists());
+    assert!(source.join("d").is_dir());
+    assert!(!fs::symlink_metadata(source.join("d")).unwrap().is_symlink());
+    assert_eq!(
+        fs::read_to_string(source.join("d/evil.txt")).unwrap(),
+        "pwned"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn kind_changes_and_renames_land() {

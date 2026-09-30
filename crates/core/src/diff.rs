@@ -82,6 +82,11 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
     for entry in &diff.entries {
         let source = diff.to.join(&entry.path);
         let destination = diff.from.join(&entry.path);
+        // The merge plan already refuses writes under a container `ours`
+        // broke; this check is the enforcement at the write boundary so a
+        // symlinked directory inside the destination can never redirect an
+        // entry (or a removal) outside the workspace root.
+        check_container_chain(&diff.from, &destination)?;
         if entry.kind == DiffKind::Removed {
             remove_path(&destination)?;
             continue;
@@ -148,6 +153,32 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
                 destination,
                 portable::MetadataTarget::FileOrDirectory,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a write or removal whose destination chain contains a symlink:
+/// `fs::copy` and `fs::remove_*` follow intermediate components, so a
+/// directory replaced by a symlink inside the destination root would send
+/// the operation outside the workspace. A missing ancestor is left to the
+/// operation itself to report.
+fn check_container_chain(root: &Path, destination: &Path) -> Result<()> {
+    for directory in destination
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| *directory != root && !directory.as_os_str().is_empty())
+    {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::Path(format!(
+                    "refusing to operate through symlinked directory: {}",
+                    directory.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())

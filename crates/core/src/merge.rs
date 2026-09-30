@@ -267,6 +267,15 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     let mut clean = Vec::new();
     let mut conflicts = Vec::new();
     let mut next_base = base.entries.clone();
+    // What `ours` will look like at each visited path once the clean
+    // entries apply: `true` means a real directory that can hold writes.
+    // `paths` visits ancestors before their descendants, so a write can
+    // verify its whole container chain before it is classified clean —
+    // without this, a clean add lands in a directory `ours` deleted,
+    // kind-changed, or turned into a symlink (which would write through
+    // the link, outside the workspace).
+    let mut usable_dir: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut conflicted: BTreeSet<PathBuf> = BTreeSet::new();
     for path in paths {
         let b = base.base_entry(&path);
         let o = ours.get(&path);
@@ -274,6 +283,10 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         if t == b {
             // The incoming side did not change it: never write, and keep
             // the base so `ours`' own change stays visible to later merges.
+            usable_dir.insert(
+                path,
+                o.is_some_and(|entry| entry.kind == EntryKind::Directory),
+            );
             continue;
         }
         if o == b {
@@ -290,17 +303,49 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                 && t.is_none_or(|entry| entry.kind != EntryKind::Directory);
             if loses_subtree && subtree_diverged(&path, &ours, base) {
                 conflicts.push(planned(path.clone(), b, o, t));
+                conflicted.insert(path.clone());
+                usable_dir.insert(path, false);
                 continue;
             }
             match t {
                 Some(entry) if !entry.is_supported() => {
                     conflicts.push(planned(path.clone(), b, o, t));
+                    conflicted.insert(path.clone());
+                    usable_dir.insert(path, false);
+                }
+                _ if kind != DiffKind::Removed && !containers_usable(&path, &usable_dir) => {
+                    // An ancestor is missing, not a directory, or itself
+                    // conflicted in `ours` — a delete-vs-modify conflict,
+                    // never a write. Blocked ancestors that were skipped
+                    // (`theirs` unchanged) escalate to conflicts too, so a
+                    // forced merge restores the incoming side's directory
+                    // before it writes the child.
+                    for ancestor in proper_ancestors(&path) {
+                        if usable_dir.get(ancestor) == Some(&false)
+                            && !conflicted.contains(ancestor)
+                        {
+                            conflicts.push(planned(
+                                ancestor.to_path_buf(),
+                                base.base_entry(ancestor),
+                                ours.get(ancestor),
+                                theirs.get(ancestor),
+                            ));
+                            conflicted.insert(ancestor.to_path_buf());
+                        }
+                    }
+                    conflicts.push(planned(path.clone(), b, o, t));
+                    conflicted.insert(path.clone());
+                    usable_dir.insert(path, false);
                 }
                 _ => {
                     clean.push(DiffEntry {
                         path: path.clone(),
                         kind,
                     });
+                    usable_dir.insert(
+                        path.clone(),
+                        t.is_some_and(|entry| entry.kind == EntryKind::Directory),
+                    );
                     set_base(&mut next_base, path, t);
                 }
             }
@@ -308,10 +353,16 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         }
         if o == t {
             // Both sides ended up identical: converged without a write.
+            usable_dir.insert(
+                path.clone(),
+                o.is_some_and(|entry| entry.kind == EntryKind::Directory),
+            );
             set_base(&mut next_base, path, t);
             continue;
         }
         conflicts.push(planned(path.clone(), b, o, t));
+        conflicted.insert(path.clone());
+        usable_dir.insert(path, false);
     }
     clean.sort_by(|a, b| a.path.cmp(&b.path));
     conflicts.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
@@ -320,6 +371,21 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         conflicts,
         next_base,
     })
+}
+
+/// The proper ancestors of `path` inside the workspace, nearest first.
+fn proper_ancestors(path: &Path) -> impl Iterator<Item = &Path> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty())
+}
+
+/// Every ancestor of `path` must resolve to a real directory in `ours`
+/// after the merge: directories created by this plan count, while a
+/// missing, non-directory, or conflicted ancestor means the write could
+/// fail mid-apply — or escape the workspace through a symlink.
+fn containers_usable(path: &Path, usable_dir: &BTreeMap<PathBuf, bool>) -> bool {
+    proper_ancestors(path).all(|ancestor| usable_dir.get(ancestor).copied().unwrap_or(false))
 }
 
 /// What one side did to `path` relative to the base.
