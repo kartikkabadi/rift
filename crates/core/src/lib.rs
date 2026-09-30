@@ -226,6 +226,7 @@ pub enum Backend {
 /// The result of probing what a path supports.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Probe {
+    #[serde(serialize_with = "crate::diff::serialize_path")]
     pub path: PathBuf,
     pub backend: Backend,
     /// The filesystem type name when the platform can report it.

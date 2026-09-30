@@ -73,7 +73,9 @@ enum Command {
 #[serde(untagged)]
 enum Value {
     Empty(()),
+    #[serde(serialize_with = "crate::diff::serialize_path")]
     Path(PathBuf),
+    #[serde(serialize_with = "crate::diff::serialize_paths")]
     Paths(Vec<PathBuf>),
     Report(Probe),
     Diff(TreeDiff),
@@ -92,7 +94,10 @@ enum Response {
 struct Failure {
     code: &'static str,
     message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::diff::serialize_path_option"
+    )]
     path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hook: Option<String>,
@@ -298,6 +303,7 @@ fn execute(input: &str) -> Result<Value, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ConflictEntry, DiffEntry, DiffKind};
 
     #[test]
     fn serializes_errors_with_structured_hook_state() {
@@ -398,5 +404,58 @@ mod tests {
             }
         ));
         assert!(matches!(doctor.command, Command::Doctor { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_serialize_lossily_instead_of_failing() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // serde cannot serialize a non-UTF-8 PathBuf; the wire form is a
+        // string with U+FFFD markers so the response — and the completed
+        // land outcome it carries — survives.
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"conflict-\xff.txt"));
+        let outcome = crate::LandOutcome {
+            applied: crate::TreeDiff {
+                from: PathBuf::from("/tmp/parent"),
+                to: PathBuf::from("/tmp/rift"),
+                entries: vec![DiffEntry {
+                    path: path.clone(),
+                    kind: DiffKind::Changed,
+                }],
+            },
+            conflicts: vec![ConflictEntry {
+                path: path.clone(),
+                ours: DiffKind::Changed,
+                theirs: DiffKind::Changed,
+            }],
+        };
+        let response = serde_json::to_string(&Response::Ok {
+            value: Value::Merge(outcome),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(
+            value["value"]["conflicts"][0]["path"],
+            "conflict-\u{FFFD}.txt"
+        );
+        assert_eq!(
+            value["value"]["applied"]["entries"][0]["path"],
+            "conflict-\u{FFFD}.txt"
+        );
+
+        // Same for the error wire: a non-UTF-8 path inside a Failure must
+        // not collapse the error itself into a serialization failure.
+        let failure = serde_json::to_string(&Response::Error {
+            error: Failure::from(Error::IoAt {
+                operation: "copy",
+                path: path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+            }),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&failure).unwrap();
+        assert_eq!(value["error"]["path"], "conflict-\u{FFFD}.txt");
     }
 }

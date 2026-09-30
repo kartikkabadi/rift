@@ -20,6 +20,7 @@ pub enum DiffKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DiffEntry {
     /// Path relative to the compared roots.
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub kind: DiffKind,
 }
@@ -27,9 +28,43 @@ pub struct DiffEntry {
 /// The file-level changes that turn `from` into `to`.
 #[derive(Clone, Debug, Serialize)]
 pub struct TreeDiff {
+    #[serde(serialize_with = "serialize_path")]
     pub from: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub to: PathBuf,
     pub entries: Vec<DiffEntry>,
+}
+
+/// Serializes a path as a lossy UTF-8 string on the wire: serde's
+/// `PathBuf` serializer errors on non-UTF-8 names, which would collapse a
+/// whole RPC response — including a completed land outcome — into a
+/// serialization failure. U+FFFD markers keep the response intact.
+pub(crate) fn serialize_path<P: AsRef<Path>, S: serde::Serializer>(
+    path: &P,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.as_ref().to_string_lossy())
+}
+
+pub(crate) fn serialize_paths<S: serde::Serializer>(
+    paths: &[PathBuf],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+pub(crate) fn serialize_path_option<S: serde::Serializer>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match path {
+        Some(path) => serialize_path(path, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl TreeDiff {

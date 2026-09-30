@@ -67,6 +67,7 @@ impl LandOptions {
 /// change each side made relative to the base.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConflictEntry {
+    #[serde(serialize_with = "crate::diff::serialize_path")]
     pub path: PathBuf,
     pub ours: DiffKind,
     pub theirs: DiffKind,
