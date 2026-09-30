@@ -517,6 +517,47 @@ fn land_never_writes_through_a_symlinked_directory() {
     );
 }
 
+#[test]
+fn case_folded_name_collisions_report_a_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // On a case-insensitive volume the two names are one file: landing
+    // must report it instead of silently overwriting the parent's file.
+    fs::write(source.join("report.txt"), "parent-version").unwrap();
+    fs::write(child.join("Report.txt"), "rift-version").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    if source.join(".RIFT").exists() {
+        assert!(
+            outcome
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.path == Path::new("Report.txt")),
+            "{:?}",
+            outcome.conflicts
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("report.txt")).unwrap(),
+            "parent-version"
+        );
+    } else {
+        // A case-sensitive filesystem keeps the two names distinct.
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(
+            fs::read_to_string(source.join("report.txt")).unwrap(),
+            "parent-version"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("Report.txt")).unwrap(),
+            "rift-version"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn kind_changes_and_renames_land() {

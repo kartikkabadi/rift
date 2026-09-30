@@ -276,6 +276,25 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     // the link, outside the workspace).
     let mut usable_dir: BTreeMap<PathBuf, bool> = BTreeMap::new();
     let mut conflicted: BTreeSet<PathBuf> = BTreeSet::new();
+    // On a case-insensitive volume two byte-distinct names are one
+    // directory slot: writing `Report.txt` over `report.txt` is a silent
+    // overwrite, not an add. Probed once and folded maps built lazily, so
+    // clean merges pay nothing for the check.
+    let mut insensitive: Option<bool> = None;
+    let mut folded_ours: Option<BTreeMap<Vec<u8>, PathBuf>> = None;
+    let mut folded_theirs: Option<BTreeMap<Vec<u8>, Vec<PathBuf>>> = None;
+    let mut name_collides = |path: &Path| {
+        if !*insensitive.get_or_insert_with(|| volume_ignores_case(ours_root)) {
+            return false;
+        }
+        let folded_ours = folded_ours.get_or_insert_with(|| fold_map(&ours));
+        let folded_theirs = folded_theirs.get_or_insert_with(|| fold_map_multi(&theirs));
+        let key = fold_key(path);
+        folded_ours
+            .get(&key)
+            .is_some_and(|other| other.as_path() != path)
+            || folded_theirs.get(&key).is_some_and(|twins| twins.len() > 1)
+    };
     for path in paths {
         let b = base.base_entry(&path);
         let o = ours.get(&path);
@@ -337,6 +356,14 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                     conflicted.insert(path.clone());
                     usable_dir.insert(path, false);
                 }
+                _ if kind != DiffKind::Removed && name_collides(&path) => {
+                    // The write would land on a differently-cased sibling:
+                    // one filesystem slot, two names — a conflict, not an
+                    // overwrite.
+                    conflicts.push(planned(path.clone(), b, o, t));
+                    conflicted.insert(path.clone());
+                    usable_dir.insert(path, false);
+                }
                 _ => {
                     clean.push(DiffEntry {
                         path: path.clone(),
@@ -386,6 +413,66 @@ fn proper_ancestors(path: &Path) -> impl Iterator<Item = &Path> {
 /// fail mid-apply — or escape the workspace through a symlink.
 fn containers_usable(path: &Path, usable_dir: &BTreeMap<PathBuf, bool>) -> bool {
     proper_ancestors(path).all(|ancestor| usable_dir.get(ancestor).copied().unwrap_or(false))
+}
+
+/// The name a case-insensitive filesystem would store: Unicode-lowercased
+/// when the path is UTF-8, ASCII-lowercased byte-wise otherwise so two
+/// distinct names can never collapse into a false match.
+fn fold_key(path: &Path) -> Vec<u8> {
+    match path.to_str() {
+        Some(text) => text.to_lowercase().into_bytes(),
+        None => path.as_os_str().as_encoded_bytes().to_ascii_lowercase(),
+    }
+}
+
+fn fold_map(manifest: &BTreeMap<PathBuf, Entry>) -> BTreeMap<Vec<u8>, PathBuf> {
+    manifest
+        .keys()
+        .map(|path| (fold_key(path), path.clone()))
+        .collect()
+}
+
+fn fold_map_multi(manifest: &BTreeMap<PathBuf, Entry>) -> BTreeMap<Vec<u8>, Vec<PathBuf>> {
+    let mut map: BTreeMap<Vec<u8>, Vec<PathBuf>> = BTreeMap::new();
+    for path in manifest.keys() {
+        map.entry(fold_key(path)).or_default().push(path.clone());
+    }
+    map
+}
+
+/// Whether the volume holding `root` ignores letter case: `.RIFT` only
+/// resolves to the `.rift` marker when the filesystem folds the name, and
+/// comparing file identity keeps a real `.RIFT` file on a case-sensitive
+/// volume from looking folded.
+fn volume_ignores_case(root: &Path) -> bool {
+    same_file(&root.join(".rift"), &root.join(".RIFT"))
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Some(a), Some(b)) = (
+        crate::strategy::portable::by_handle_info(a),
+        crate::strategy::portable::by_handle_info(b),
+    ) else {
+        return false;
+    };
+    a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+        && a.nFileIndexHigh == b.nFileIndexHigh
+        && a.nFileIndexLow == b.nFileIndexLow
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 /// What one side did to `path` relative to the base.
