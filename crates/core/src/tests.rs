@@ -1510,3 +1510,23 @@ fn root_workspace_has_no_parent_for_diff_land_or_sync() {
     assert!(matches!(manager.land(&source), Err(Error::NoParent { .. })));
     assert!(matches!(manager.sync(&source), Err(Error::NoParent { .. })));
 }
+
+#[test]
+fn the_family_lock_is_released_when_the_operation_panics() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let root = manager.workspace_at(&source).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<()> = manager.with_root_lock(&root, |_| panic!("land exploded"));
+    }));
+    assert!(result.is_err());
+
+    // A panic must not leave a live-pid lock row: the family stays
+    // usable for the rest of the process's lifetime (the Bun FFI host
+    // catches the panic and keeps running).
+    assert!(manager.registry.lock_root(&root.id).unwrap());
+    manager.registry.unlock_root(&root.id).unwrap();
+}

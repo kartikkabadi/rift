@@ -775,39 +775,45 @@ impl Manager {
             if !self.registry.lock_root(&root.id)? {
                 continue;
             }
-            let result = (|| -> Result<Vec<PathBuf>> {
-                let storage = match default_storage(&root.path) {
-                    Ok(storage) => storage,
-                    Err(_) => return Ok(Vec::new()),
-                };
-                if !storage.is_dir() {
-                    return Ok(Vec::new());
-                }
-                let mut swept = Vec::new();
-                for entry in fs::read_dir(&storage)? {
-                    let entry = entry?;
-                    let candidate = entry.path();
-                    let is_directory = entry
-                        .file_type()
-                        .map(|file_type| file_type.is_dir())
-                        .unwrap_or(false);
-                    // Internal folders (`.trash`, nested `.rifts`) belong
-                    // to rift itself, not to any registry row.
-                    if !is_directory || crate::diff::is_internal(Path::new(&entry.file_name())) {
-                        continue;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<Vec<PathBuf>> {
+                    let storage = match default_storage(&root.path) {
+                        Ok(storage) => storage,
+                        Err(_) => return Ok(Vec::new()),
+                    };
+                    if !storage.is_dir() {
+                        return Ok(Vec::new());
                     }
-                    // Checked inside the lock, so a `create` that just
-                    // committed is never swept.
-                    if self.registry.record_at(&candidate)?.is_some() {
-                        continue;
+                    let mut swept = Vec::new();
+                    for entry in fs::read_dir(&storage)? {
+                        let entry = entry?;
+                        let candidate = entry.path();
+                        let is_directory = entry
+                            .file_type()
+                            .map(|file_type| file_type.is_dir())
+                            .unwrap_or(false);
+                        // Internal folders (`.trash`, nested `.rifts`) belong
+                        // to rift itself, not to any registry row.
+                        if !is_directory || crate::diff::is_internal(Path::new(&entry.file_name()))
+                        {
+                            continue;
+                        }
+                        // Checked inside the lock, so a `create` that just
+                        // committed is never swept.
+                        if self.registry.record_at(&candidate)?.is_some() {
+                            continue;
+                        }
+                        self.strategy.remove_directory(&candidate)?;
+                        swept.push(candidate);
                     }
-                    self.strategy.remove_directory(&candidate)?;
-                    swept.push(candidate);
-                }
-                Ok(swept)
-            })();
-            let _ = self.registry.unlock_root(&root.id);
-            swept.extend(result?);
+                    Ok(swept)
+                },
+            ));
+            self.release_root(&root.id);
+            match result {
+                Ok(result) => swept.extend(result?),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }
         Ok(removed
             .into_iter()
@@ -1015,8 +1021,10 @@ impl Manager {
     }
 
     /// Runs `f` holding the workspace family's merge lock. The lock is a
-    /// registry row, so file work happens outside any SQLite transaction
-    /// and a failed `f` still releases it.
+    /// registry row, so file work happens outside any SQLite transaction,
+    /// and the row is released on every exit — Ok, Err, or unwinding —
+    /// because a panic must not leave a live-pid row that locks the
+    /// family for the rest of the process's lifetime.
     fn with_root_lock<T>(
         &mut self,
         root: &Record,
@@ -1025,16 +1033,21 @@ impl Manager {
         if !self.registry.lock_root(&root.id)? {
             return Err(Error::Locked(root.path.clone()));
         }
-        let result = f(self);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.release_root(&root.id);
         match result {
-            Err(error) => {
-                let _ = self.registry.unlock_root(&root.id);
-                Err(error)
-            }
-            Ok(value) => {
-                self.registry.unlock_root(&root.id)?;
-                Ok(value)
-            }
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Best-effort lock release. A failed delete is never reported as the
+    /// operation's error — the work already happened — and the leftover
+    /// row is reclaimed once its pid dies. One immediate retry covers a
+    /// transient database error.
+    fn release_root(&mut self, root_id: &RiftId) {
+        if self.registry.unlock_root(root_id).is_err() {
+            let _ = self.registry.unlock_root(root_id);
         }
     }
 }
