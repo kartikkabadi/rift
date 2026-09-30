@@ -142,6 +142,12 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
         if file_type.is_dir() {
             if existing.is_none() || !same_kind {
                 fs::create_dir(&destination)?;
+            } else {
+                // The destination may resolve through case folding to an
+                // entry stored under a different case — the surviving half
+                // of a case-only rename. Take the incoming side's name so
+                // the pair applies as a rename rather than a no-op.
+                rename_folded_twin(&destination)?;
             }
             directories.insert(destination.clone());
         } else if file_type.is_file() {
@@ -156,6 +162,9 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
                 }
             }
             copy_file(&source, &destination)?;
+            // Renaming over a folded sibling replaces the entry but keeps
+            // the stored case (APFS); take the incoming side's exact name.
+            rename_folded_twin(&destination)?;
         } else if file_type.is_symlink() {
             if existing.is_some() {
                 remove_path(&destination)?;
@@ -211,6 +220,32 @@ fn check_container_chain(root: &Path, destination: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+    Ok(())
+}
+
+/// On a case-folding volume `destination` can resolve to an entry stored
+/// under a different case. Rename that stored sibling so the write lands
+/// under the incoming side's exact name. A no-op on case-sensitive
+/// volumes and when the stored name already matches.
+fn rename_folded_twin(destination: &Path) -> Result<()> {
+    let Some(name) = destination.file_name() else {
+        return Ok(());
+    };
+    let Ok(canonical) = fs::canonicalize(destination) else {
+        return Ok(());
+    };
+    let Some(stored) = canonical.file_name() else {
+        return Ok(());
+    };
+    if stored == name {
+        return Ok(());
+    }
+    // A case fold is the only difference this may resolve: never move an
+    // unrelated entry over the destination.
+    if stored.to_string_lossy().to_lowercase() != name.to_string_lossy().to_lowercase() {
+        return Ok(());
+    }
+    fs::rename(destination.with_file_name(stored), destination)?;
     Ok(())
 }
 

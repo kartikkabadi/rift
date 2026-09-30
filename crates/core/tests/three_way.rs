@@ -736,3 +736,183 @@ fn sync_force_restores_a_container_the_rift_deleted() {
         "changed"
     );
 }
+
+/// Whether the volume holding a workspace folds letter case: `.RIFT` only
+/// resolves to the `.rift` marker when it does. Mirrors the merge's own
+/// probe so expectations can branch per filesystem.
+fn folds_case(workspace: &Path) -> bool {
+    workspace.join(".RIFT").exists()
+}
+
+/// On a case-folding volume a theirs-side case-only rename is one
+/// filesystem slot: the `Added` half collides with the ours-side twin and
+/// the `Removed` half must be held back with it — never applied alone.
+/// Under force the pair applies together and the slot takes the incoming
+/// side's name.
+fn case_only_rename_keeps_the_file(old_name: &str, new_name: &str) {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join(old_name), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    fs::rename(child.join(old_name), child.join(new_name)).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    if !folds_case(&source) {
+        // Case-sensitive volumes hold both names: the rename is a plain
+        // remove plus add.
+        assert!(outcome.conflicts.is_empty());
+        assert!(!source.join(old_name).exists());
+        assert_eq!(fs::read_to_string(source.join(new_name)).unwrap(), "v1");
+        return;
+    }
+
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new(new_name)),
+        "{:?}",
+        outcome.conflicts
+    );
+    // The shared slot still holds ours' entry: nothing was deleted.
+    assert_eq!(fs::read_to_string(source.join(old_name)).unwrap(), "v1");
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let names = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name == new_name), "{names:?}");
+    assert!(!names.iter().any(|name| name == old_name), "{names:?}");
+    assert_eq!(fs::read_to_string(source.join(new_name)).unwrap(), "v1");
+}
+
+#[test]
+fn case_only_file_rename_to_uppercase_keeps_the_file() {
+    case_only_rename_keeps_the_file("report.txt", "Report.txt");
+}
+
+#[test]
+fn case_only_file_rename_to_lowercase_keeps_the_file() {
+    case_only_rename_keeps_the_file("README.md", "readme.md");
+}
+
+/// The directory version of `case_only_rename_keeps_the_file`: every
+/// removal inside the recased tree pairs with a same-slot write.
+fn case_only_dir_rename_keeps_the_tree(old_name: &str, new_name: &str) {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join(old_name)).unwrap();
+    fs::write(source.join(old_name).join("note.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    fs::rename(child.join(old_name), child.join(new_name)).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    if !folds_case(&source) {
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(
+            fs::read_to_string(source.join(new_name).join("note.txt")).unwrap(),
+            "v1"
+        );
+        assert!(!source.join(old_name).exists());
+        return;
+    }
+
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new(new_name)),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(source.join(old_name).join("note.txt")).unwrap(),
+        "v1"
+    );
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let names = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name == new_name), "{names:?}");
+    assert!(!names.iter().any(|name| name == old_name), "{names:?}");
+    assert_eq!(
+        fs::read_to_string(source.join(new_name).join("note.txt")).unwrap(),
+        "v1"
+    );
+}
+
+#[test]
+fn case_only_dir_rename_to_lowercase_keeps_the_tree() {
+    case_only_dir_rename_keeps_the_tree("Docs", "docs");
+}
+
+#[test]
+fn case_only_dir_rename_to_uppercase_keeps_the_tree() {
+    case_only_dir_rename_keeps_the_tree("notes", "Notes");
+}
+
+#[test]
+fn case_only_rename_over_an_ours_edit_holds_and_force_absorbs_the_slot() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    // Ours edits the file while theirs recases it: both halves conflict.
+    fs::write(source.join("report.txt"), "ours-edit").unwrap();
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+    fs::write(child.join("Report.txt"), "theirs-edit").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("report.txt")).unwrap(),
+        "ours-edit"
+    );
+
+    // Force takes the incoming side: the slot ends with theirs' content
+    // under theirs' name — applying the removal after the add must not
+    // delete the entry just written.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("Report.txt")).unwrap(),
+        "theirs-edit"
+    );
+}

@@ -935,7 +935,16 @@ impl Manager {
         };
         for conflict in plan.conflicts {
             if options.on_conflict == OnConflict::Force {
-                entries.push(conflict.forced());
+                let forced = conflict.forced();
+                // On a folded volume a fold-twin write already absorbed
+                // the shared filesystem slot (the incoming half of a
+                // case-only rename); replaying the removal afterwards
+                // would delete the entry just written.
+                if forced.kind != DiffKind::Removed
+                    || !plan.absorbed_removals.contains(&forced.path)
+                {
+                    entries.push(forced);
+                }
                 merge::set_resolved(&mut next_base.entries, &conflict);
             } else {
                 conflicts.push(conflict.entry);

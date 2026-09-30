@@ -226,6 +226,11 @@ pub(crate) struct MergePlan {
     pub(crate) clean: Vec<DiffEntry>,
     /// Paths both sides changed incompatibly.
     pub(crate) conflicts: Vec<PlannedConflict>,
+    /// Removals whose filesystem slot a fold-twin write absorbs on a
+    /// case-insensitive volume: replaying them after the write would
+    /// delete the entry just written, so a forced merge must skip them.
+    /// See the case-fold pass at the end of [`plan`].
+    pub(crate) absorbed_removals: BTreeSet<PathBuf>,
     /// Base entries after the clean paths land: conflicted paths keep
     /// their old values so the conflict stays visible to future merges.
     pub(crate) next_base: BTreeMap<PathBuf, BaseEntry>,
@@ -398,11 +403,50 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         conflicted.insert(path.clone());
         usable_dir.insert(path, false);
     }
+    // On a case-folding volume a theirs-side case-only rename splits into
+    // `Removed <old>` and `Added <new>` over a single filesystem slot. The
+    // add always collides with the ours-side twin and is held back as a
+    // conflict, so the removal must never apply alone — that would delete
+    // the file the rename only recased. The pair reports as the add's
+    // conflict; under `force` the add's write absorbs the slot and the
+    // removal must be skipped, because replaying it afterwards would
+    // delete the entry just written.
+    let mut absorbed_removals = BTreeSet::new();
+    if insensitive.unwrap_or(false) {
+        let folded_theirs = folded_theirs.get_or_insert_with(|| fold_map_multi(&theirs));
+        let twin_is_incoming = |path: &Path| {
+            folded_theirs.get(&fold_key(path)).is_some_and(|twins| {
+                twins
+                    .iter()
+                    .any(|twin| twin.as_path() != path && theirs.get(twin) != base.base_entry(twin))
+            })
+        };
+        clean.retain(|entry| {
+            if entry.kind == DiffKind::Removed && twin_is_incoming(&entry.path) {
+                // Not applied and not a separate conflict: the fold-twin's
+                // collision already reports the pair. The base row stays
+                // so the held-back half remains visible to later merges.
+                set_base(
+                    &mut next_base,
+                    entry.path.clone(),
+                    base.base_entry(&entry.path),
+                );
+                return false;
+            }
+            true
+        });
+        absorbed_removals = conflicts
+            .iter()
+            .filter(|conflict| conflict.theirs.is_none() && twin_is_incoming(&conflict.entry.path))
+            .map(|conflict| conflict.entry.path.clone())
+            .collect();
+    }
     clean.sort_by(|a, b| a.path.cmp(&b.path));
     conflicts.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
     Ok(MergePlan {
         clean,
         conflicts,
+        absorbed_removals,
         next_base,
     })
 }
