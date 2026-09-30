@@ -126,12 +126,12 @@ export function diff({ at = process.cwd(), database } = {}) {
   return call({ command: "diff", at, database })
 }
 
-export function land({ at = process.cwd(), database } = {}) {
-  return call({ command: "land", at, database })
+export function land({ at = process.cwd(), onConflict, filesOnly, database } = {}) {
+  return call({ command: "land", at, onConflict, filesOnly, database })
 }
 
-export function sync({ at = process.cwd(), database } = {}) {
-  return call({ command: "sync", at, database })
+export function sync({ at = process.cwd(), onConflict, filesOnly, database } = {}) {
+  return call({ command: "sync", at, onConflict, filesOnly, database })
 }
 
 export function gc({ database } = {}) {

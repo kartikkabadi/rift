@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use rift::{
-    Backend, CopyMode, CowMode, Create, CreateOptions, HookMode, InitProgress, Manager,
-    RemoveOptions,
+    Backend, CopyMode, CowMode, Create, CreateOptions, HookMode, InitProgress, LandOptions,
+    Manager, OnConflict, RemoveOptions,
 };
 use std::io::Read;
 use std::path::PathBuf;
@@ -19,6 +19,11 @@ enum CliError {
         "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
     )]
     ForceRequired,
+    /// Clean paths were applied but conflicting paths remain; exits 2.
+    #[error(
+        "conflicting path(s) were not applied; resolve them and rerun, or rerun with --on-conflict force to take the incoming version"
+    )]
+    Conflicts,
 }
 
 #[derive(Parser)]
@@ -30,6 +35,23 @@ struct Cli {
     shell_cwd: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ConflictMode {
+    Report,
+    Abort,
+    Force,
+}
+
+impl From<ConflictMode> for OnConflict {
+    fn from(mode: ConflictMode) -> Self {
+        match mode {
+            ConflictMode::Report => OnConflict::Report,
+            ConflictMode::Abort => OnConflict::Abort,
+            ConflictMode::Force => OnConflict::Force,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -192,6 +214,15 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// What to do when both workspaces changed the same path: report
+        /// applies clean paths and lists conflicts (exit 2), abort writes
+        /// nothing, force takes the incoming version.
+        #[arg(long, value_enum, default_value_t = ConflictMode::Report)]
+        on_conflict: ConflictMode,
+        /// Merge only working-tree files; required when the workspaces live
+        /// in a Git repository, where `.git` is never replayed.
+        #[arg(long)]
+        files_only: bool,
     },
     /// Pull the source workspace's latest files into this rift (the reverse
     /// of `rift land`).
@@ -199,6 +230,15 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// What to do when both workspaces changed the same path: report
+        /// applies clean paths and lists conflicts (exit 2), abort writes
+        /// nothing, force takes the incoming version.
+        #[arg(long, value_enum, default_value_t = ConflictMode::Report)]
+        on_conflict: ConflictMode,
+        /// Merge only working-tree files; required when the workspaces live
+        /// in a Git repository, where `.git` is never replayed.
+        #[arg(long)]
+        files_only: bool,
     },
     Gc,
 }
@@ -210,7 +250,10 @@ fn main() {
             _ => error.to_string(),
         };
         eprintln!("{message}");
-        std::process::exit(1);
+        std::process::exit(match error {
+            CliError::Conflicts => 2,
+            _ => 1,
+        });
     }
 }
 
@@ -496,25 +539,31 @@ fn run() -> Result<()> {
             print_diff(&diff, json);
             Ok(())
         }
-        Command::Land { at, json } => {
-            let diff = manager.land(at.unwrap_or(std::env::current_dir()?))?;
-            print_diff(&diff, json);
-            eprintln!(
-                "landed {} change(s) into {}",
-                diff.entries.len(),
-                diff.from.display()
-            );
-            Ok(())
+        Command::Land {
+            at,
+            json,
+            on_conflict,
+            files_only,
+        } => {
+            let options = LandOptions::default()
+                .on_conflict(on_conflict.into())
+                .files_only(files_only);
+            let outcome =
+                manager.land_with_options(at.unwrap_or(std::env::current_dir()?), options)?;
+            print_outcome("landed", &outcome, json)
         }
-        Command::Sync { at, json } => {
-            let diff = manager.sync(at.unwrap_or(std::env::current_dir()?))?;
-            print_diff(&diff, json);
-            eprintln!(
-                "synced {} change(s) from {}",
-                diff.entries.len(),
-                diff.to.display()
-            );
-            Ok(())
+        Command::Sync {
+            at,
+            json,
+            on_conflict,
+            files_only,
+        } => {
+            let options = LandOptions::default()
+                .on_conflict(on_conflict.into())
+                .files_only(files_only);
+            let outcome =
+                manager.sync_with_options(at.unwrap_or(std::env::current_dir()?), options)?;
+            print_outcome("synced", &outcome, json)
         }
         Command::Gc => {
             for path in manager.gc()? {
@@ -522,6 +571,45 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// Prints a land/sync outcome: the applied diff, each conflict, then the
+/// summary line. Conflicts exit 2 so scripts can react.
+fn print_outcome(verb: &str, outcome: &rift::LandOutcome, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(outcome).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        print_diff(&outcome.applied, json);
+        for conflict in &outcome.conflicts {
+            println!(
+                "C {} (this: {}, incoming: {})",
+                conflict.path.display(),
+                side(conflict.ours),
+                side(conflict.theirs)
+            );
+        }
+    }
+    eprintln!(
+        "{verb} {} change(s) into {}",
+        outcome.applied.entries.len(),
+        outcome.applied.from.display()
+    );
+    if outcome.conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::Conflicts)
+    }
+}
+
+fn side(kind: rift::DiffKind) -> &'static str {
+    match kind {
+        rift::DiffKind::Added => "added",
+        rift::DiffKind::Changed => "changed",
+        rift::DiffKind::Removed => "removed",
     }
 }
 

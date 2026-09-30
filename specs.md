@@ -12,10 +12,11 @@
 init(input: {
   at: AbsolutePath
   cowOnly?: boolean
-}): void
+}): "registered" | "already_initialized" | "converted" | "degraded"
 ```
 
-`init` prepares and registers an original workspace for Rift.
+`init` prepares and registers an original workspace for Rift. The RPC returns the outcome so callers can report a
+degraded (regular-copy) filesystem.
 
 - On Linux, `at` uses btrfs or native reflinks when available; on other supported systems, initialization registers the workspace without filesystem conversion.
 - When no instant-copy backend applies to `at`, `init` registers the workspace anyway and reports that future `create` calls will be regular copies. The `--cow-only` flag turns this into a hard failure for callers that require instant copies.
@@ -147,29 +148,38 @@ diff(input: {
 }): { from: AbsolutePath; to: AbsolutePath; entries: { path: RelativePath; kind: "added" | "removed" | "changed" }[] }
 ```
 
-`diff` reports the file-level changes inside `at` relative to the parent workspace it was copied from. Entries are
-compared by kind, size, modification time, mode, and symlink target — a file that was copied with its metadata intact
-counts as unchanged. Each workspace's own `.rift` marker is bookkeeping and never appears in the result.
+`diff` reports the file-level changes inside `at` relative to the rift's recorded base — the exact tree it was copied
+from. Entries are compared by content hash, mode, and symlink target, so a rewrite that preserves size and
+modification time still counts as a change while a pure `touch` does not. Each workspace's own `.rift` marker is
+bookkeeping and never appears in the result.
 
 - `at` must be a managed workspace with a recorded parent; the root workspace fails with a no-parent error.
-- File content is not hashed: two entries with equal fingerprints are treated as identical, which is the same
-  guarantee `create` relies on when it preserves metadata.
+- Paths the copy filter excluded at creation stay invisible to `diff` — a filtered rift never reports its parent's
+  `node_modules` as deleted, and a rift-installed one never reports as added.
 
 ### `land`
 
 ```ts
 land(input: {
   at: AbsolutePath
-}): TreeDiff
+  onConflict?: "report" | "abort" | "force"
+  filesOnly?: boolean
+}): LandOutcome
 ```
 
-`land` applies the rift's changes back into its parent workspace and returns the diff it applied. Added and changed
-entries are copied into the parent with their metadata; removed entries are deleted from the parent; symlinks are
-recreated. The `.git` directory is synchronized like any other, so commits made inside the rift land along with the
-working tree.
+`land` three-way merges the rift's changes into its parent against the base recorded at creation and returns a
+`LandOutcome { applied: TreeDiff, conflicts: ConflictEntry[] }`. For every path the parent's copy counts as `ours` and
+the rift's as `theirs`: a path the rift never touched never writes; a path only the rift changed is applied; paths both
+sides changed are a no-op when the results are identical and a conflict otherwise, including delete-against-edit in
+either direction.
 
-- `land` is a file-level replay, not a three-way merge: where the parent's copy of a path differs, the rift's version
-  wins. Files only the parent touched are untouched.
+- `onConflict: "report"` (the default) applies every clean path and lists the conflicts; `"abort"` writes nothing when
+  any path conflicts; `"force"` applies the rift's version for conflicts too.
+- Conflicts stay visible: they keep their old base entry, so the next `land` or `sync` reports them again instead of
+  treating them as resolved.
+- `.git` is never replayed file-by-file. When either workspace is a Git repository, `land` fails with `use_git`
+  unless `filesOnly` is set, which merges only working-tree files.
+- The recorded base advances to the merged state after a land, so rifts created in sequence cannot undo one another.
 - The rift remains a registered, usable workspace afterward; `remove` discards it when finished.
 
 ### `sync`
@@ -177,11 +187,13 @@ working tree.
 ```ts
 sync(input: {
   at: AbsolutePath
-}): TreeDiff
+  onConflict?: "report" | "abort" | "force"
+  filesOnly?: boolean
+}): LandOutcome
 ```
 
-`sync` is `land` in the opposite direction: the parent's current state is applied onto the rift, so a rift created
-before the source moved on picks up the new files, edits, and deletions.
+`sync` is `land` in the opposite direction with the same merge rules: the rift is `ours` and the parent is `theirs`,
+so paths the rift changed are never overwritten and surface as conflicts instead.
 
 ### `gc`
 
@@ -196,6 +208,9 @@ gc(): AbsolutePath[]
 - On reflink-backed Linux filesystems, recursively remove the reflinked directory tree.
 - Delete each trash registry record after its filesystem directory is successfully removed.
 - Delete active registry records whose filesystem directories were removed outside Rift only when no existing recorded descendant would be orphaned, and include pruned missing paths in the result.
+- Unregistered folders under each root's default storage directory are crash debris — a copy that never reached the
+  registry — and are deleted. Internal folders (`.trash`, nested `.rifts`) and live `create` operations are never
+  swept.
 
 ## Metadata
 
@@ -220,6 +235,19 @@ CREATE TABLE trash (
   path TEXT NOT NULL UNIQUE,
   removed_at INTEGER NOT NULL
 );
+
+CREATE TABLE rift_base (
+  rift_id TEXT PRIMARY KEY REFERENCES rift(id) ON DELETE CASCADE,
+  base_manifest BLOB NOT NULL,
+  base_head TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE land_locks (
+  root_id TEXT PRIMARY KEY REFERENCES rift(id) ON DELETE CASCADE,
+  pid INTEGER NOT NULL,
+  started_at INTEGER NOT NULL
+);
 ```
 
 - Every managed rift has a stable generated `id`.
@@ -232,6 +260,12 @@ CREATE TABLE trash (
 - `path` is its current location, not its identity.
 - Provenance is a rooted tree. Descendants of any rift can be listed through recursive queries over `parent_id`.
 - `remove` moves a whole active subtree into trash, so no surviving active record depends on deleted ancestry.
+- `rift_base` records the exact tree each rift started from (`base_manifest`) plus the destination's Git head when it
+  is a repository (`base_head`, provenance only — never merged). It is inserted in the same transaction as the rift
+  row and advanced after every `land`/`sync`.
+- `land_locks` is the per-root merge lock: `create`, `land`, `sync`, and `remove` insert the root's row before file
+  work and delete it afterward; a row owned by a dead process is reclaimed. File work happens outside SQLite
+  transactions, so other workspace families are never blocked.
 
 ## Git Integration
 
@@ -251,7 +285,9 @@ Refuse creation from a Git repository when:
 - A merge, rebase, cherry-pick, revert, or bisect is in progress.
 - Git lock or inconsistent index state makes an exact safe copy unclear.
 
-The tool does not create branches, commit changes, or otherwise replace normal Git commands.
+The tool does not create branches, commit changes, or otherwise replace normal Git commands. `land` and `sync` never
+replay `.git` file-by-file: in a Git repository they fail with `use_git` unless `filesOnly` is set, and repository
+state always moves through Git itself. Commits made on either side after a fork survive both operations.
 
 ## Copy Strategies
 
