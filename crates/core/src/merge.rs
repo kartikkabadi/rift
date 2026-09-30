@@ -336,23 +336,16 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                 _ if kind != DiffKind::Removed && !containers_usable(&path, &usable_dir) => {
                     // An ancestor is missing, not a directory, or itself
                     // conflicted in `ours` — a delete-vs-modify conflict,
-                    // never a write. Blocked ancestors that were skipped
-                    // (`theirs` unchanged) escalate to conflicts too, so a
-                    // forced merge restores the incoming side's directory
-                    // before it writes the child.
-                    for ancestor in proper_ancestors(&path) {
-                        if usable_dir.get(ancestor) == Some(&false)
-                            && !conflicted.contains(ancestor)
-                        {
-                            conflicts.push(planned(
-                                ancestor.to_path_buf(),
-                                base.base_entry(ancestor),
-                                ours.get(ancestor),
-                                theirs.get(ancestor),
-                            ));
-                            conflicted.insert(ancestor.to_path_buf());
-                        }
-                    }
+                    // never a write.
+                    escalate_blocked_ancestors(
+                        &path,
+                        base,
+                        &ours,
+                        &theirs,
+                        &usable_dir,
+                        &mut conflicted,
+                        &mut conflicts,
+                    );
                     conflicts.push(planned(path.clone(), b, o, t));
                     conflicted.insert(path.clone());
                     usable_dir.insert(path, false);
@@ -388,6 +381,19 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
             set_base(&mut next_base, path, t);
             continue;
         }
+        // A conflicted path may still be force-applied, so a broken
+        // ours-side container chain escalates exactly like a clean
+        // write's: the incoming side's ancestor directories are restored
+        // before the conflicted child is written.
+        escalate_blocked_ancestors(
+            &path,
+            base,
+            &ours,
+            &theirs,
+            &usable_dir,
+            &mut conflicted,
+            &mut conflicts,
+        );
         conflicts.push(planned(path.clone(), b, o, t));
         conflicted.insert(path.clone());
         usable_dir.insert(path, false);
@@ -399,6 +405,32 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         conflicts,
         next_base,
     })
+}
+
+/// Marks `path`'s ancestors that cannot hold a write in post-merge `ours`
+/// — missing, not a directory, or themselves conflicted — as conflicts,
+/// so a forced merge restores the incoming side's container chain before
+/// it writes the child.
+fn escalate_blocked_ancestors(
+    path: &Path,
+    base: &BaseManifest,
+    ours: &BTreeMap<PathBuf, Entry>,
+    theirs: &BTreeMap<PathBuf, Entry>,
+    usable_dir: &BTreeMap<PathBuf, bool>,
+    conflicted: &mut BTreeSet<PathBuf>,
+    conflicts: &mut Vec<PlannedConflict>,
+) {
+    for ancestor in proper_ancestors(path) {
+        if usable_dir.get(ancestor) == Some(&false) && !conflicted.contains(ancestor) {
+            conflicts.push(planned(
+                ancestor.to_path_buf(),
+                base.base_entry(ancestor),
+                ours.get(ancestor),
+                theirs.get(ancestor),
+            ));
+            conflicted.insert(ancestor.to_path_buf());
+        }
+    }
 }
 
 /// The proper ancestors of `path` inside the workspace, nearest first.

@@ -638,3 +638,101 @@ fn kind_changes_and_renames_land() {
         "renamed"
     );
 }
+
+#[test]
+fn land_force_restores_a_container_ours_deleted() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/x.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The parent deletes the whole directory; the rift edits a file inside
+    // it — a natural conflict under a missing container. Force must
+    // restore the incoming side's chain instead of failing on ENOENT.
+    fs::remove_dir_all(source.join("d")).unwrap();
+    fs::write(child.join("d/x.txt"), "changed").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("d/x.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!source.join("d").exists());
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("d/x.txt")).unwrap(),
+        "changed"
+    );
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+#[test]
+fn land_force_restores_a_container_ours_turned_into_a_file() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/x.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The parent replaced `d` with a plain file; the rift edits inside it.
+    fs::remove_dir_all(source.join("d")).unwrap();
+    fs::write(source.join("d"), "a file").unwrap();
+    fs::write(child.join("d/x.txt"), "changed").unwrap();
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert!(source.join("d").is_dir());
+    assert_eq!(
+        fs::read_to_string(source.join("d/x.txt")).unwrap(),
+        "changed"
+    );
+}
+
+#[test]
+fn sync_force_restores_a_container_the_rift_deleted() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    fs::write(source.join("d/x.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The rift deletes the directory; the parent edits inside it. Forcing
+    // a sync must rebuild the rift-side chain before writing the conflict.
+    fs::remove_dir_all(child.join("d")).unwrap();
+    fs::write(source.join("d/x.txt"), "changed").unwrap();
+
+    let forced = manager
+        .sync_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(child.join("d/x.txt")).unwrap(),
+        "changed"
+    );
+}
