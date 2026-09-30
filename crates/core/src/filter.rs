@@ -25,6 +25,13 @@ impl CopyFilter {
 fn excludes_component(part: &OsStr) -> bool {
     [
         "node_modules",
+        // Rift's own storage dirs: a workspace that holds another family's
+        // `.rifts`/`.trash`/`.rifts-images` must not copy them recursively.
+        ".rifts",
+        ".trash",
+        ".rifts-images",
+        // The marker's in-flight temp file; a crash can leave it behind.
+        ".rift.tmp",
         ".pnpm-store",
         "target",
         ".venv",
@@ -72,6 +79,9 @@ mod tests {
         assert!(filter.excludes(Path::new("packages/app/node_modules/react/index.js")));
         assert!(filter.excludes(Path::new("packages/app/.yarn/cache/react.zip")));
         assert!(filter.excludes(Path::new(".git/fsmonitor--daemon.ipc")));
+        assert!(filter.excludes(Path::new(".rifts/app/child/file.txt")));
+        assert!(filter.excludes(Path::new(".trash/abc-file.txt")));
+        assert!(filter.excludes(Path::new(".rifts-images/disk.img")));
         assert!(!filter.excludes(Path::new("packages/app/package-lock.json")));
     }
 }

@@ -56,6 +56,8 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
     };
+    // `/.rift` anchors the root marker; `/.rift.tmp` hides the temp file an
+    // interrupted atomic marker write can leave behind.
     if existing
         .lines()
         .any(|line| line.trim_end_matches(' ') == "/.rift")
@@ -67,7 +69,10 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
     } else {
         "\n"
     };
-    fs::write(exclude, format!("{existing}{separator}/.rift\n"))?;
+    fs::write(
+        exclude,
+        format!("{existing}{separator}/.rift\n/.rift.tmp\n"),
+    )?;
     Ok(())
 }
 
@@ -120,6 +125,28 @@ pub(crate) fn make_writable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The commit `.git/HEAD` points at — the hash for a detached HEAD, or the
+/// ref it names resolved through loose refs or `packed-refs`. `None` when
+/// HEAD cannot be resolved (unborn branch, no `.git`, odd layout). Recorded
+/// in the base manifest as provenance; it never participates in merges.
+pub(crate) fn head_commit(workspace: &Path) -> Option<String> {
+    let head = fs::read_to_string(workspace.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ") else {
+        return Some(head.to_owned());
+    };
+    let reference = reference.trim();
+    if let Ok(hash) = fs::read_to_string(workspace.join(".git").join(reference)) {
+        return Some(hash.trim().to_owned());
+    }
+    fs::read_to_string(workspace.join(".git").join("packed-refs"))
+        .ok()?
+        .lines()
+        .find(|line| line.ends_with(&format!(" {reference}")))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_head_commit(path: &Path) -> Option<git2::Oid> {
     let repository = git2::Repository::open(path).ok()?;
@@ -165,24 +192,24 @@ mod tests {
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "/.rift\n"
+            "/.rift\n/.rift.tmp\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), "existing").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n"
+            "existing\n/.rift\n/.rift.tmp\n"
         );
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n"
+            "existing\n/.rift\n/.rift.tmp\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), " /.rift\n").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            " /.rift\n/.rift\n"
+            " /.rift\n/.rift\n/.rift.tmp\n"
         );
     }
 

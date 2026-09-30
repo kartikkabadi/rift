@@ -1,0 +1,386 @@
+//! Three-way `land`/`sync` semantics: independent changes merge, divergent
+//! changes report conflicts, excluded paths stay invisible, and `.git` is
+//! never replayed file-by-file.
+
+use rift::{Create, Error, LandOptions, Manager, OnConflict};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::TempDir;
+
+fn manager(temp: &TempDir) -> Manager {
+    Manager::open(temp.path().join("registry.sqlite")).unwrap()
+}
+
+fn source(temp: &TempDir) -> PathBuf {
+    let source = temp.path().join("app");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file.txt"), "hello").unwrap();
+    fs::write(source.join("other.txt"), "other").unwrap();
+    fs::canonicalize(source).unwrap()
+}
+
+fn git(path: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "git {:?} failed in {}",
+        args,
+        path.display()
+    );
+}
+
+fn git_stdout(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn land_applies_only_fork_changes_and_keeps_parent_edits() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // Each side edits a different file after the copy.
+    fs::write(child.join("file.txt"), "from rift").unwrap();
+    fs::write(source.join("other.txt"), "from parent").unwrap();
+    let outcome = manager.land(&child).unwrap();
+
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(outcome.applied.entries.len(), 1);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "from rift"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("other.txt")).unwrap(),
+        "from parent"
+    );
+}
+
+#[test]
+fn land_reports_conflicts_without_applying_them() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::write(child.join("file.txt"), "rift version").unwrap();
+    fs::write(source.join("file.txt"), "parent version").unwrap();
+    // An unaffected path still lands.
+    fs::write(child.join("clean.txt"), "clean").unwrap();
+    let outcome = manager.land(&child).unwrap();
+
+    assert_eq!(outcome.conflicts.len(), 1);
+    assert_eq!(outcome.conflicts[0].path, Path::new("file.txt"));
+    assert_eq!(outcome.applied.entries.len(), 1);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "parent version"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("clean.txt")).unwrap(),
+        "clean"
+    );
+
+    // The conflict is sticky: it is not silently reclassified as clean,
+    // and the next land reports it again rather than landing the rift's
+    // version over the parent's.
+    let second = manager.land(&child).unwrap();
+    assert_eq!(second.conflicts.len(), 1);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "parent version"
+    );
+}
+
+#[test]
+fn land_abort_writes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::write(child.join("file.txt"), "rift version").unwrap();
+    fs::write(child.join("clean.txt"), "clean").unwrap();
+    fs::write(source.join("file.txt"), "parent version").unwrap();
+
+    let error = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Abort),
+        )
+        .unwrap_err();
+    assert!(matches!(error, Error::LandConflict { .. }), "{error}");
+    assert!(!source.join("clean.txt").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "parent version"
+    );
+}
+
+#[test]
+fn land_force_takes_the_rifts_version() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::write(child.join("file.txt"), "rift version").unwrap();
+    fs::write(source.join("file.txt"), "parent version").unwrap();
+    let outcome = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "rift version"
+    );
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+#[test]
+fn delete_against_edit_conflicts_in_both_directions() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // The rift deletes a file the parent edited.
+    fs::remove_file(child.join("file.txt")).unwrap();
+    fs::write(source.join("file.txt"), "parent edit").unwrap();
+    // The rift edits a file the parent deleted.
+    fs::write(child.join("other.txt"), "rift edit").unwrap();
+    fs::remove_file(source.join("other.txt")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+
+    assert_eq!(outcome.conflicts.len(), 2);
+    // Neither conflicting path was applied.
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "parent edit"
+    );
+    assert!(!source.join("other.txt").exists());
+    assert_eq!(
+        fs::read_to_string(child.join("other.txt")).unwrap(),
+        "rift edit"
+    );
+}
+
+#[test]
+fn sync_never_overwrites_rift_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::write(child.join("file.txt"), "rift version").unwrap();
+    fs::write(source.join("file.txt"), "parent version").unwrap();
+    fs::write(source.join("upstream.txt"), "new upstream").unwrap();
+    let outcome = manager.sync(&child).unwrap();
+
+    // The parent's clean additions sync in; the divergent edit conflicts.
+    assert_eq!(outcome.conflicts.len(), 1);
+    assert_eq!(outcome.conflicts[0].path, Path::new("file.txt"));
+    assert_eq!(
+        fs::read_to_string(child.join("file.txt")).unwrap(),
+        "rift version"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("upstream.txt")).unwrap(),
+        "new upstream"
+    );
+}
+
+#[test]
+fn base_manifest_survives_manager_reopen() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let child;
+    {
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        child = manager.create(Create::new(&source)).unwrap();
+    }
+    // A fresh process view must load the recorded base.
+    let mut manager = manager(&temp);
+
+    fs::write(child.join("file.txt"), "from rift").unwrap();
+    fs::write(source.join("other.txt"), "from parent").unwrap();
+    let outcome = manager.land(&child).unwrap();
+
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "from rift"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("other.txt")).unwrap(),
+        "from parent"
+    );
+}
+
+#[test]
+fn land_and_sync_in_a_git_repository_require_files_only() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    git(&source, &["init"]);
+    git(&source, &["config", "user.email", "test@example.com"]);
+    git(&source, &["config", "user.name", "Test"]);
+    git(&source, &["add", "file.txt"]);
+    git(&source, &["commit", "-m", "initial"]);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::write(child.join("file.txt"), "from rift").unwrap();
+    assert!(matches!(manager.land(&child), Err(Error::UseGit(_))));
+    assert!(matches!(manager.sync(&child), Err(Error::UseGit(_))));
+
+    // filesOnly merges the working tree without touching `.git`.
+    let head = git_stdout(&source, &["rev-parse", "HEAD"]);
+    let outcome = manager
+        .land_with_options(&child, LandOptions::default().files_only(true))
+        .unwrap();
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "from rift"
+    );
+    assert_eq!(git_stdout(&source, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn same_size_same_mtime_content_change_lands() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // Rewrite with identical length and the copied mtime: only the content
+    // hash can see this change.
+    let child_file = child.join("file.txt");
+    let mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&child_file).unwrap());
+    fs::write(&child_file, "xxxxx").unwrap();
+    filetime::set_file_times(&child_file, mtime, mtime).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert_eq!(outcome.applied.entries.len(), 1);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "xxxxx"
+    );
+}
+
+#[test]
+fn excluded_paths_are_invisible_to_diff_and_land() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+    fs::write(source.join("node_modules/pkg/index.js"), "module").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // A fresh filtered rift diffs clean, and the parent's regenerable
+    // folders never appear as removals.
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    // The rift installs its own dependencies; they must never land.
+    fs::create_dir_all(child.join("node_modules/left-pad")).unwrap();
+    fs::write(child.join("node_modules/left-pad/index.js"), "pad").unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty());
+    assert!(outcome.applied.is_clean());
+    assert!(!source.join("node_modules/left-pad").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("node_modules/pkg/index.js")).unwrap(),
+        "module"
+    );
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+#[test]
+fn unicode_names_empty_directories_and_binary_files_land() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::create_dir_all(child.join("ünïcode/空")).unwrap();
+    fs::write(child.join("ünïcode/空/nöte.bin"), [0_u8, 159, 146, 150]).unwrap();
+    fs::create_dir_all(child.join("empty")).unwrap();
+    fs::remove_file(child.join("file.txt")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(
+        fs::read(source.join("ünïcode/空/nöte.bin")).unwrap(),
+        [0_u8, 159, 146, 150]
+    );
+    assert!(source.join("empty").is_dir());
+    assert!(!source.join("file.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn kind_changes_and_renames_land() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("old-name.txt"), "renamed").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // file.txt becomes a directory, other.txt becomes a symlink, and
+    // old-name.txt is renamed (a delete plus an add).
+    fs::remove_file(child.join("file.txt")).unwrap();
+    fs::create_dir_all(child.join("file.txt/nested")).unwrap();
+    fs::write(child.join("file.txt/nested/inner.txt"), "inner").unwrap();
+    fs::remove_file(child.join("other.txt")).unwrap();
+    std::os::unix::fs::symlink("file.txt", child.join("other.txt")).unwrap();
+    fs::remove_file(child.join("old-name.txt")).unwrap();
+    fs::write(child.join("new-name.txt"), "renamed").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt/nested/inner.txt")).unwrap(),
+        "inner"
+    );
+    assert_eq!(
+        fs::read_link(source.join("other.txt")).unwrap(),
+        Path::new("file.txt")
+    );
+    assert!(!source.join("old-name.txt").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("new-name.txt")).unwrap(),
+        "renamed"
+    );
+}

@@ -1,6 +1,6 @@
 use crate::{
-    CopyMode, CowMode, Create, CreateOptions, Error, HookMode, Manager, Probe, RemoveOptions,
-    TreeDiff,
+    CopyMode, CowMode, Create, CreateOptions, Error, HookMode, LandOptions, LandOutcome, Manager,
+    OnConflict, Probe, RemoveOptions, TreeDiff,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -54,9 +54,17 @@ enum Command {
     },
     Land {
         at: PathBuf,
+        #[serde(rename = "onConflict")]
+        on_conflict: Option<OnConflict>,
+        #[serde(rename = "filesOnly")]
+        files_only: Option<bool>,
     },
     Sync {
         at: PathBuf,
+        #[serde(rename = "onConflict")]
+        on_conflict: Option<OnConflict>,
+        #[serde(rename = "filesOnly")]
+        files_only: Option<bool>,
     },
     Gc,
 }
@@ -69,6 +77,8 @@ enum Value {
     Paths(Vec<PathBuf>),
     Report(Probe),
     Diff(TreeDiff),
+    Merge(LandOutcome),
+    Init(crate::InitOutcome),
 }
 
 #[derive(Serialize)]
@@ -129,6 +139,10 @@ impl From<Error> for Failure {
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
             Error::CowImageSetup(_) => ("cow_image_setup", None),
             Error::NoParent { path, .. } => ("no_parent", Some(path.clone())),
+            Error::UseGit(path) => ("use_git", Some(path.clone())),
+            Error::LandConflict { path, .. } => ("land_conflict", Some(path.clone())),
+            Error::Locked(path) => ("locked", Some(path.clone())),
+            Error::CorruptBase(_) => ("corrupt_base", None),
         };
         let (hook, committed) = match &error {
             Error::HookFailed { hook, .. } => (
@@ -172,6 +186,13 @@ fn cow_mode(cow_only: Option<bool>) -> CowMode {
     }
 }
 
+fn land_options(on_conflict: Option<OnConflict>, files_only: Option<bool>) -> LandOptions {
+    LandOptions {
+        on_conflict: on_conflict.unwrap_or_default(),
+        files_only: files_only.unwrap_or(false),
+    }
+}
+
 fn serialize(response: Response) -> String {
     serde_json::to_string(&response).unwrap_or_else(|_| {
         r#"{"status":"error","error":{"code":"serialization","message":"failed to serialize response"}}"#
@@ -197,7 +218,7 @@ fn execute(input: &str) -> Result<Value, Failure> {
             }
             manager
                 .init_with_cow_mode(at, cow_mode(cow_only), |_| {})
-                .map(|_| Value::Empty(()))
+                .map(Value::Init)
                 .map_err(Failure::from)
         }
         Command::Create {
@@ -254,8 +275,22 @@ fn execute(input: &str) -> Result<Value, Failure> {
             .map(Value::Paths)
             .map_err(Failure::from),
         Command::Diff { at } => manager.diff(at).map(Value::Diff).map_err(Failure::from),
-        Command::Land { at } => manager.land(at).map(Value::Diff).map_err(Failure::from),
-        Command::Sync { at } => manager.sync(at).map(Value::Diff).map_err(Failure::from),
+        Command::Land {
+            at,
+            on_conflict,
+            files_only,
+        } => manager
+            .land_with_options(at, land_options(on_conflict, files_only))
+            .map(Value::Merge)
+            .map_err(Failure::from),
+        Command::Sync {
+            at,
+            on_conflict,
+            files_only,
+        } => manager
+            .sync_with_options(at, land_options(on_conflict, files_only))
+            .map(Value::Merge)
+            .map_err(Failure::from),
         Command::Gc => manager.gc().map(Value::Paths).map_err(Failure::from),
     }
 }
@@ -315,6 +350,33 @@ mod tests {
             Command::Remove {
                 all: Some(true),
                 hooks: Some(false),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accepts_land_and_sync_merge_options() {
+        let land = serde_json::from_str::<Request>(
+            r#"{"command":"land","at":"/tmp/app","onConflict":"force","filesOnly":true}"#,
+        )
+        .unwrap();
+        let sync =
+            serde_json::from_str::<Request>(r#"{"command":"sync","at":"/tmp/app"}"#).unwrap();
+
+        assert!(matches!(
+            land.command,
+            Command::Land {
+                on_conflict: Some(OnConflict::Force),
+                files_only: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            sync.command,
+            Command::Sync {
+                on_conflict: None,
+                files_only: None,
                 ..
             }
         ));

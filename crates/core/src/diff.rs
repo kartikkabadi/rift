@@ -39,10 +39,11 @@ impl TreeDiff {
 }
 
 /// The changes `to` made relative to `from`: added in `to`, removed from
-/// `from`, or differing between them.
-pub(crate) fn diff_trees(from: &Path, to: &Path) -> Result<TreeDiff> {
-    let left = manifest(from)?;
-    let right = manifest(to)?;
+/// `from`, or differing between them. `skip` hides relative paths on both
+/// sides (the base manifest's excluded paths).
+pub(crate) fn diff_trees(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<TreeDiff> {
+    let left = manifest(from, skip)?;
+    let right = manifest(to, skip)?;
     let mut entries = Vec::new();
     for (path, entry) in &left {
         match right.get(path) {
@@ -204,41 +205,75 @@ fn make_writable(path: &Path) -> Result<()> {
 }
 
 /// A content fingerprint for one filesystem entry. Two entries with equal
-/// fingerprints are treated as unchanged: files compare by size,
-/// modification time, and mode; symlinks by target; directories by mode
-/// only, since a directory's own mtime shifts whenever a child changes.
-#[derive(Debug, Eq, PartialEq)]
-struct Entry {
-    kind: EntryKind,
-    size: u64,
-    modified_nanos: i64,
-    mode: u32,
-    link_target: Option<PathBuf>,
-    /// `.git/HEAD` resolved to its commit: `create` detaches a rift's HEAD
-    /// into the raw hash while the source keeps `ref: <branch>` — different
-    /// bytes for the same checkout. When set, it replaces the other fields'
-    /// comparison.
-    head_commit: Option<String>,
+/// fingerprints are treated as unchanged: files compare by blake3 content
+/// hash and mode, so a rewrite that preserves size and mtime still counts
+/// as a change while a pure `touch` does not. Symlinks compare by target
+/// and mode; directories by mode only, since a directory's own mtime shifts
+/// whenever a child changes. Entries that are neither file, directory, nor
+/// symlink (fifos, sockets, devices) are recorded as `Other`: they show up
+/// in diffs but can never be applied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Entry {
+    pub(crate) kind: EntryKind,
+    pub(crate) mode: u32,
+    pub(crate) link_target: Option<PathBuf>,
+    pub(crate) hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     Directory,
     File,
     Symlink,
+    Other,
 }
 
-fn manifest(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
+impl Entry {
+    /// A path `theirs` can deliver through `apply_diff`.
+    pub(crate) fn is_supported(&self) -> bool {
+        !matches!(self.kind, EntryKind::Other)
+    }
+}
+
+/// Path components that never participate in diffs or lands: git internals
+/// (workspaces land git state through git, never file replay) and rift's
+/// own storage directories, which can sit inside a workspace that hosts
+/// another workspace family.
+pub(crate) fn is_internal(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name == ".git" || name == ".rifts" || name == ".trash" || name == ".rifts-images"
+        )
+    })
+}
+
+/// Walks `root` and records a fingerprint per entry. The workspace's own
+/// `.rift` marker and internal paths are skipped; `skip` excludes
+/// additional relative paths (the base manifest's visibility rules).
+pub(crate) fn manifest(
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+) -> Result<BTreeMap<PathBuf, Entry>> {
     let marker = marker::path(root);
+    let marker_tmp = root.join(".rift.tmp");
     let mut entries = BTreeMap::new();
     for entry in WalkDir::new(root)
         .min_depth(1)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .is_ok_and(|path| !is_internal(path) && !skip(path))
+        })
     {
         let entry = entry?;
         let path = entry.path();
-        if path == marker {
+        // `.rift.tmp` is the in-flight marker write; a crash can leave it.
+        if path == marker || path == marker_tmp {
             continue;
         }
         let relative = path
@@ -253,69 +288,34 @@ fn manifest(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
         } else if file_type.is_symlink() {
             EntryKind::Symlink
         } else {
-            return Err(Error::UnsupportedEntry(path.to_path_buf()));
-        };
-        let modified_nanos = metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as i64)
-            .unwrap_or(0);
-        let head_commit = if file_type.is_file() && relative == Path::new(".git/HEAD") {
-            resolved_head_commit(root)
-        } else {
-            None
+            EntryKind::Other
         };
         entries.insert(
             relative.to_path_buf(),
             Entry {
                 kind,
-                size: if head_commit.is_none() && file_type.is_file() {
-                    metadata.len()
-                } else {
-                    0
-                },
-                modified_nanos: if head_commit.is_none() && kind == EntryKind::File {
-                    modified_nanos
-                } else {
-                    0
-                },
-                mode: if head_commit.is_none() {
-                    mode(&metadata)
-                } else {
-                    0
-                },
+                mode: mode(&metadata),
                 link_target: if file_type.is_symlink() {
                     Some(fs::read_link(path)?)
                 } else {
                     None
                 },
-                head_commit,
+                hash: if file_type.is_file() {
+                    Some(*hash_file(path)?.as_bytes())
+                } else {
+                    None
+                },
             },
         );
     }
     Ok(entries)
 }
 
-/// The commit `.git/HEAD` points at — `hash` for a detached HEAD, or the ref
-/// it names resolved through loose refs or `packed-refs`. `None` when HEAD
-/// cannot be resolved (unborn branch, odd layout), which falls back to a
-/// plain metadata comparison.
-fn resolved_head_commit(root: &Path) -> Option<String> {
-    let head = fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
-    let head = head.trim();
-    let Some(reference) = head.strip_prefix("ref: ") else {
-        return Some(head.to_owned());
-    };
-    let reference = reference.trim();
-    if let Ok(hash) = fs::read_to_string(root.join(".git").join(reference)) {
-        return Some(hash.trim().to_owned());
-    }
-    fs::read_to_string(root.join(".git").join("packed-refs"))
-        .ok()?
-        .lines()
-        .find(|line| line.ends_with(&format!(" {reference}")))
-        .and_then(|line| line.split_whitespace().next())
-        .map(str::to_owned)
+fn hash_file(path: &Path) -> Result<blake3::Hash> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize())
 }
 
 #[cfg(unix)]

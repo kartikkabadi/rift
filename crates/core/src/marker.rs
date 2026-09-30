@@ -6,8 +6,14 @@ pub(crate) fn path(workspace: &Path) -> PathBuf {
     workspace.join(".rift")
 }
 
+/// Writes the marker atomically: a reader mid-write must never see a
+/// half-written id, and a crash must not lose the marker for a workspace
+/// the registry already knows.
 pub(crate) fn write(workspace: &Path, id: &RiftId) -> Result<()> {
-    fs::write(path(workspace), format!("{id}\n"))?;
+    let destination = path(workspace);
+    let temporary = workspace.join(".rift.tmp");
+    fs::write(&temporary, format!("{id}\n"))?;
+    fs::rename(&temporary, &destination)?;
     Ok(())
 }
 

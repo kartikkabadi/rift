@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 dirs.workspace = true
 filetime.workspace = true
 libc.workspace = true

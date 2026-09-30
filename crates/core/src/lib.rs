@@ -6,6 +6,7 @@ mod git;
 mod hook;
 mod id;
 mod marker;
+mod merge;
 mod name;
 mod registry;
 pub mod rpc;
@@ -85,9 +86,35 @@ pub enum Error {
         path: PathBuf,
         operation: &'static str,
     },
+    /// `land`/`sync` reached a workspace inside a Git repository without
+    /// `files_only`: repository state belongs to Git and is never replayed
+    /// file-by-file.
+    #[error(
+        "{0} is a Git repository; land or sync it through Git, or pass filesOnly to merge working-tree files only"
+    )]
+    UseGit(PathBuf),
+    /// `land`/`sync` ran with `on_conflict: abort` and found conflicting
+    /// paths; nothing was written.
+    #[error(
+        "{operation} found {conflicts} conflicting path(s) in {path}; rerun with onConflict 'report' to apply clean paths or 'force' to take the incoming side"
+    )]
+    LandConflict {
+        operation: &'static str,
+        path: PathBuf,
+        conflicts: usize,
+    },
+    /// Another `create`, `land`, `sync`, or `remove` holds the root
+    /// workspace's lock.
+    #[error("{0} is locked by another rift operation")]
+    Locked(PathBuf),
+    /// A recorded base manifest cannot be decoded; the rift's merge base is
+    /// unknown, so landing it cannot be proven safe.
+    #[error("recorded base manifest is corrupt: {0}")]
+    CorruptBase(String),
 }
 
 pub use diff::{DiffEntry, DiffKind, TreeDiff};
+pub use merge::{ConflictEntry, LandOptions, LandOutcome, OnConflict};
 
 pub struct Create {
     pub from: PathBuf,
@@ -228,7 +255,8 @@ pub enum InitProgress {
     RegisteringWorkspace,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InitOutcome {
     Registered,
     AlreadyInitialized,
@@ -267,6 +295,11 @@ impl Manager {
     }
 
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let registry = Registry::open(path)?;
         Ok(Self { registry, strategy })
     }
@@ -282,9 +315,25 @@ impl Manager {
     ) -> Result<PathBuf> {
         let requested = existing_directory(&input.from)?;
         let source = self.workspace_from(&requested)?;
-        let from = source.path.clone();
-        let git = git::check_source(&from)?;
+        let git = git::check_source(&source.path)?;
         let root = self.root(&source)?;
+        // The copy must not interleave with a `land`/`sync`/`remove`
+        // writing the same workspace family.
+        self.with_root_lock(&root, |this| {
+            this.create_locked(&source, &root, input, options, git)
+        })
+    }
+
+    /// The body of `create_with_options` once the family lock is held.
+    fn create_locked(
+        &mut self,
+        source: &Record,
+        root: &Record,
+        input: Create,
+        options: CreateOptions,
+        git: git::Source,
+    ) -> Result<PathBuf> {
+        let from = source.path.clone();
         let id = RiftId::new();
         let destination_parent = match input.into {
             Some(path) => absolute_path(&path)?,
@@ -353,7 +402,21 @@ impl Manager {
             if git.is_repository() {
                 git::hide_marker(&from)?;
             }
-            self.registry.insert_child(&id, &source.id, &destination)?;
+            // The base is recorded in the same transaction as the rift row,
+            // so a rift can never exist without the manifest its `land` and
+            // `sync` merge against.
+            let base = merge::BaseManifest::record(
+                &from,
+                &destination,
+                options.copy_mode == CopyMode::Filtered,
+            )?;
+            self.registry.insert_child_with_base(
+                &id,
+                &source.id,
+                &destination,
+                &base.encode(),
+                git::head_commit(&destination).as_deref(),
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -457,6 +520,12 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let config = self.remove_config(&record.path, options)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| this.remove_locked(&record, config))
+    }
+
+    /// The body of `remove_with_options` once the family lock is held.
+    fn remove_locked(&mut self, record: &Record, config: config::Config) -> Result<()> {
         let parent_id = record.parent_id.as_ref().unwrap_or(&record.id);
         hook::run(
             "preremove",
@@ -468,7 +537,7 @@ impl Manager {
             parent_id,
         )?;
         if record.parent_id.is_none() {
-            self.unregister_root(&record)?;
+            self.unregister_root(record)?;
             return hook::run(
                 "postremove",
                 config.postremove(),
@@ -507,6 +576,16 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let config = self.remove_config(&record.path, options)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| this.remove_all_locked(&record, config))
+    }
+
+    /// The body of `remove_all_with_options` once the family lock is held.
+    fn remove_all_locked(
+        &mut self,
+        record: &Record,
+        config: config::Config,
+    ) -> Result<Vec<PathBuf>> {
         let parent_id = record.parent_id.as_ref().unwrap_or(&record.id);
         hook::run(
             "preremove",
@@ -685,9 +764,55 @@ impl Manager {
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>>>()?;
         self.registry.delete_active_records(&missing)?;
+
+        // A crash between the copy and the registry insert leaves an
+        // unregistered folder under the storage root; sweep it.
+        let mut swept = Vec::new();
+        for root in self.registry.root_paths()? {
+            // A held lock means another process is copying into this
+            // family right now; leave its half-written tree for the next
+            // pass.
+            if !self.registry.lock_root(&root.id)? {
+                continue;
+            }
+            let result = (|| -> Result<Vec<PathBuf>> {
+                let storage = match default_storage(&root.path) {
+                    Ok(storage) => storage,
+                    Err(_) => return Ok(Vec::new()),
+                };
+                if !storage.is_dir() {
+                    return Ok(Vec::new());
+                }
+                let mut swept = Vec::new();
+                for entry in fs::read_dir(&storage)? {
+                    let entry = entry?;
+                    let candidate = entry.path();
+                    let is_directory = entry
+                        .file_type()
+                        .map(|file_type| file_type.is_dir())
+                        .unwrap_or(false);
+                    // Internal folders (`.trash`, nested `.rifts`) belong
+                    // to rift itself, not to any registry row.
+                    if !is_directory || crate::diff::is_internal(Path::new(&entry.file_name())) {
+                        continue;
+                    }
+                    // Checked inside the lock, so a `create` that just
+                    // committed is never swept.
+                    if self.registry.record_at(&candidate)?.is_some() {
+                        continue;
+                    }
+                    self.strategy.remove_directory(&candidate)?;
+                    swept.push(candidate);
+                }
+                Ok(swept)
+            })();
+            let _ = self.registry.unlock_root(&root.id);
+            swept.extend(result?);
+        }
         Ok(removed
             .into_iter()
             .chain(missing.into_iter().map(|record| record.path))
+            .chain(swept)
             .collect())
     }
 
@@ -696,42 +821,136 @@ impl Manager {
     }
 
     /// The file-level changes inside the workspace at `at` relative to the
-    /// parent workspace it was copied from.
+    /// base it was copied from — exactly what `land` would apply. Paths the
+    /// copy filter excluded at creation are invisible. Rifts recorded before
+    /// base manifests existed fall back to a raw comparison with the parent.
     pub fn diff(&self, at: impl AsRef<Path>) -> Result<TreeDiff> {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let parent = self.parent(&record, "compare")?;
-        diff::diff_trees(&parent.path, &record.path)
+        match self.base_manifest(&record.id)? {
+            Some(base) => {
+                let current = diff::manifest(&record.path, &|path| base.invisible(path))?;
+                Ok(TreeDiff {
+                    from: parent.path.clone(),
+                    to: record.path.clone(),
+                    entries: base.diff(&current),
+                })
+            }
+            None => diff::diff_trees(&parent.path, &record.path, &|_| false),
+        }
     }
 
-    /// Applies the workspace's changes back into its parent workspace,
-    /// making the parent's files match the rift's. A rift has no three-way
-    /// merge: each differing path takes the rift's version, including the
-    /// `.git` directory (so commits made inside the rift land too).
-    pub fn land(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+    /// Applies the rift's changes into its parent workspace through a
+    /// three-way merge against the rift's recorded base. Changes the parent
+    /// made after the copy are preserved; paths both sides changed are
+    /// reported as conflicts. `.git` is never touched, and the whole
+    /// operation refuses a Git repository unless `files_only` is set.
+    pub fn land(&mut self, at: impl AsRef<Path>) -> Result<LandOutcome> {
+        self.land_with_options(at, LandOptions::default())
+    }
+
+    pub fn land_with_options(
+        &mut self,
+        at: impl AsRef<Path>,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let parent = self.parent(&record, "land")?;
         marker::verify(&parent.path, &parent.id)?;
-        // Landing replays `.git` file-by-file, so refuse to copy a repository
-        // that is mid-merge/rebase or lock-file'd — a torn state could land.
-        git::check_source(&record.path)?;
-        let diff = diff::diff_trees(&parent.path, &record.path)?;
-        diff::apply_diff(&diff)?;
-        Ok(diff)
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| {
+            this.merge_workspaces("land", &record, &parent.path, &record.path, options)
+        })
     }
 
-    /// The reverse of `land`: refreshes the rift from its parent workspace,
-    /// making the rift's files match the parent's current state.
-    pub fn sync(&mut self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+    /// The reverse of `land`: merges the parent's changes into the rift
+    /// against the recorded base. Paths the rift changed are never
+    /// overwritten — they surface as conflicts instead.
+    pub fn sync(&mut self, at: impl AsRef<Path>) -> Result<LandOutcome> {
+        self.sync_with_options(at, LandOptions::default())
+    }
+
+    pub fn sync_with_options(
+        &mut self,
+        at: impl AsRef<Path>,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let parent = self.parent(&record, "sync")?;
         marker::verify(&parent.path, &parent.id)?;
-        git::check_source(&parent.path)?;
-        let diff = diff::diff_trees(&record.path, &parent.path)?;
-        diff::apply_diff(&diff)?;
-        Ok(diff)
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| {
+            this.merge_workspaces("sync", &record, &record.path, &parent.path, options)
+        })
+    }
+
+    /// Runs the three-way merge writing `ours` (the parent for `land`, the
+    /// rift for `sync`) from `theirs`, then advances the rift's base.
+    fn merge_workspaces(
+        &mut self,
+        operation: &'static str,
+        record: &Record,
+        ours: &Path,
+        theirs: &Path,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
+        let ours_git = git::check_source(ours)?;
+        let theirs_git = git::check_source(theirs)?;
+        if !options.files_only && (ours_git.is_repository() || theirs_git.is_repository()) {
+            let repository = if ours_git.is_repository() {
+                ours
+            } else {
+                theirs
+            };
+            return Err(Error::UseGit(repository.to_path_buf()));
+        }
+
+        let base = self
+            .base_manifest(&record.id)?
+            .unwrap_or_else(merge::BaseManifest::empty);
+        let plan = merge::plan(&base, ours, theirs)?;
+        if options.on_conflict == OnConflict::Abort && !plan.conflicts.is_empty() {
+            return Err(Error::LandConflict {
+                operation,
+                path: ours.to_path_buf(),
+                conflicts: plan.conflicts.len(),
+            });
+        }
+
+        let mut entries = plan.clean;
+        let mut conflicts = Vec::new();
+        let mut next_base = merge::BaseManifest {
+            filtered: base.filtered,
+            entries: plan.next_base,
+        };
+        for conflict in plan.conflicts {
+            if options.on_conflict == OnConflict::Force {
+                entries.push(conflict.forced());
+                merge::set_resolved(&mut next_base.entries, &conflict);
+            } else {
+                conflicts.push(conflict.entry);
+            }
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let applied = TreeDiff {
+            from: ours.to_path_buf(),
+            to: theirs.to_path_buf(),
+            entries,
+        };
+        diff::apply_diff(&applied)?;
+        self.registry.update_base(&record.id, &next_base.encode())?;
+        Ok(LandOutcome { applied, conflicts })
+    }
+
+    /// The recorded base manifest for a rift, decoded.
+    fn base_manifest(&self, id: &RiftId) -> Result<Option<merge::BaseManifest>> {
+        self.registry
+            .base_manifest(id)?
+            .map(|blob| merge::BaseManifest::decode(&blob))
+            .transpose()
     }
 
     fn parent(&self, record: &Record, operation: &'static str) -> Result<Record> {
@@ -793,6 +1012,30 @@ impl Manager {
                 .ok_or_else(|| Error::NotManaged(record.path.clone()))?;
         }
         Ok(current)
+    }
+
+    /// Runs `f` holding the workspace family's merge lock. The lock is a
+    /// registry row, so file work happens outside any SQLite transaction
+    /// and a failed `f` still releases it.
+    fn with_root_lock<T>(
+        &mut self,
+        root: &Record,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if !self.registry.lock_root(&root.id)? {
+            return Err(Error::Locked(root.path.clone()));
+        }
+        let result = f(self);
+        match result {
+            Err(error) => {
+                let _ = self.registry.unlock_root(&root.id);
+                Err(error)
+            }
+            Ok(value) => {
+                self.registry.unlock_root(&root.id)?;
+                Ok(value)
+            }
+        }
     }
 }
 

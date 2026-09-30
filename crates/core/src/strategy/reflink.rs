@@ -188,10 +188,13 @@ pub(super) fn copy_metadata_linux(from: &Path, to: &Path, target: MetadataTarget
 
     let metadata = fs::symlink_metadata(from)?;
     let destination = c_path(to)?;
+    // Ownership is preserved on a best-effort basis, matching the portable
+    // copy: only a privileged caller can assign an owner or group it does
+    // not belong to, and a copy owned by the caller is still correct.
     // SAFETY: `destination` is a valid null-terminated path, and uid/gid come
     // from filesystem metadata for `from`.
-    if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    unsafe {
+        libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid());
     }
     if matches!(target, MetadataTarget::FileOrDirectory) {
         fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;

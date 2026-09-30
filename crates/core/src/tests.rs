@@ -833,7 +833,13 @@ fn remove_rejects_overlapping_registered_paths_before_moving() {
     let source_id = marker_id(&source);
     manager
         .registry
-        .insert_child(&nested_id, &source_id, &nested)
+        .insert_child_with_base(
+            &nested_id,
+            &source_id,
+            &nested,
+            &crate::merge::BaseManifest::empty().encode(),
+            None,
+        )
         .unwrap();
 
     assert!(matches!(
@@ -905,6 +911,33 @@ fn gc_removes_trashed_entries() {
     assert!(deleted.contains(&first_trash));
     assert_eq!(deleted.len(), 2);
     assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[test]
+fn gc_sweeps_unregistered_folders_under_the_storage_root() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    // Crash debris: a copied tree that never reached the registry.
+    let storage = source.parent().unwrap().join(".rifts").join("app");
+    let orphan = storage.join("orphan");
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(orphan.join("leftover.txt"), "half copy").unwrap();
+    // A plain file in the storage root is not touched.
+    fs::write(storage.join("notes.txt"), "not a rift").unwrap();
+
+    let removed = manager.gc().unwrap();
+
+    assert_eq!(removed, vec![orphan.clone()]);
+    assert!(!orphan.exists());
+    assert!(storage.join("notes.txt").exists());
+    assert!(child.exists());
+    assert!(manager.list(&source).unwrap().contains(&child));
 }
 
 #[test]
@@ -1427,7 +1460,7 @@ fn land_applies_the_rifts_changes_to_the_source() {
     fs::write(child.join("file.txt"), "edited").unwrap();
     fs::write(child.join("new.txt"), "added").unwrap();
     fs::remove_file(child.join("old.txt")).unwrap();
-    let diff = manager.land(&child).unwrap();
+    let outcome = manager.land(&child).unwrap();
 
     assert_eq!(
         fs::read_to_string(source.join("file.txt")).unwrap(),
@@ -1437,7 +1470,7 @@ fn land_applies_the_rifts_changes_to_the_source() {
     assert!(!source.join("old.txt").exists());
     assert!(manager.diff(&child).unwrap().is_clean());
     // The rift keeps working after landing.
-    assert_eq!(diff.entries.len(), 3);
+    assert_eq!(outcome.applied.entries.len(), 3);
     assert!(marker::read(&child).unwrap().is_some());
 }
 
@@ -1453,7 +1486,7 @@ fn sync_pulls_the_sources_changes_into_the_rift() {
 
     fs::write(source.join("file.txt"), "upstream").unwrap();
     fs::write(source.join("later.txt"), "new upstream file").unwrap();
-    let diff = manager.sync(&child).unwrap();
+    let outcome = manager.sync(&child).unwrap();
 
     assert_eq!(
         fs::read_to_string(child.join("file.txt")).unwrap(),
@@ -1463,7 +1496,7 @@ fn sync_pulls_the_sources_changes_into_the_rift() {
         fs::read_to_string(child.join("later.txt")).unwrap(),
         "new upstream file"
     );
-    assert!(!diff.entries.is_empty());
+    assert!(!outcome.applied.entries.is_empty());
 }
 
 #[test]
