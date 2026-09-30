@@ -1,8 +1,10 @@
 use crate::{Error, Result, marker, strategy::portable};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 /// How one path differs between the two sides of a diff.
@@ -267,12 +269,18 @@ fn rename_folded_twin(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Sequence for `.rift.tmp` names, so one process staging several copies
+/// can never pick the same name twice.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Writes `destination` atomically: the copy lands in a sibling temp file
 /// and is renamed over the target inside the same directory — atomic on
 /// every filesystem, so a mid-write crash leaves a hidden `.rift.tmp`
 /// leftover rather than a truncated file at the real path. The temp name
-/// is namespaced to rift and unique per destination; a stale leftover is
-/// safe to overwrite.
+/// is namespaced to rift and unguessable (pid, sequence, random), and it
+/// is opened with `create_new`: a planted file or symlink fails the
+/// attempt instead of being silently overwritten and renamed over the
+/// destination.
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
@@ -281,21 +289,49 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let temporary = parent.join(format!(".rift.tmp.{}.{}", std::process::id(), name));
-    let result = fs::copy(source, &temporary)
-        .map_err(Error::from)
-        .and_then(|_| {
-            portable::copy_metadata(
-                source,
-                &temporary,
-                portable::MetadataTarget::FileOrDirectory,
-            )
-        })
-        .and_then(|_| fs::rename(&temporary, destination).map_err(Error::from));
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    for _ in 0..3 {
+        let temporary = parent.join(format!(
+            ".rift.tmp.{}.{}.{:016x}.{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+            rand::random::<u64>(),
+            name
+        ));
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .and_then(|mut output| {
+                let mut input = fs::File::open(source)?;
+                std::io::copy(&mut input, &mut output)?;
+                Ok(())
+            });
+        match written {
+            // A name collision — stale debris or a plant — retries with a
+            // fresh random component rather than clobbering.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            written => {
+                let result = written
+                    .map_err(Error::from)
+                    .and_then(|_| {
+                        portable::copy_metadata(
+                            source,
+                            &temporary,
+                            portable::MetadataTarget::FileOrDirectory,
+                        )
+                    })
+                    .and_then(|_| fs::rename(&temporary, destination).map_err(Error::from));
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                return result;
+            }
+        }
     }
-    result
+    Err(Error::Path(format!(
+        "could not allocate a temp file for {}",
+        destination.display()
+    )))
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -380,10 +416,30 @@ impl Entry {
     }
 }
 
+/// Whether a name is a rift-internal temp file: the marker's in-flight
+/// write `.rift.tmp`, or an `apply_diff` copy temp `.rift.tmp.<pid>.…`
+/// (`copy_file` names them `.rift.tmp.<pid>.<seq>.<random>.<name>`).
+/// Anything else that merely shares the `.rift.tmp` prefix is ordinary
+/// user content and stays visible to manifests and merges.
+pub(crate) fn is_temp_name(name: &OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    if bytes == b".rift.tmp" {
+        return true;
+    }
+    let Some(rest) = bytes.strip_prefix(b".rift.tmp.") else {
+        return false;
+    };
+    let mut fields = rest.splitn(2, |byte| *byte == b'.');
+    let pid = fields.next().unwrap_or_default();
+    !pid.is_empty()
+        && pid.iter().all(|byte| byte.is_ascii_digit())
+        && fields.next().is_some_and(|field| !field.is_empty())
+}
+
 /// Path components that never participate in diffs or lands: git internals
 /// (workspaces land git state through git, never file replay), rift's own
 /// storage directories, which can sit inside a workspace that hosts
-/// another workspace family, and `.rift.tmp*` debris — the marker's
+/// another workspace family, and `.rift.tmp*` temp debris — the marker's
 /// in-flight write and `apply_diff`'s per-file copy temps, which a crash
 /// can leave behind.
 pub(crate) fn is_internal(path: &Path) -> bool {
@@ -395,7 +451,7 @@ pub(crate) fn is_internal(path: &Path) -> bool {
                     || name == ".rifts"
                     || name == ".trash"
                     || name == ".rifts-images"
-                    || name.as_encoded_bytes().starts_with(b".rift.tmp")
+                    || is_temp_name(name)
         )
     })
 }

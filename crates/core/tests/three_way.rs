@@ -526,11 +526,15 @@ fn inflight_copy_temps_are_invisible_and_never_left_behind() {
     manager.init(&source).unwrap();
     let child = manager.create(Create::new(&source)).unwrap();
 
-    // Crash debris from an earlier apply: a `.rift.tmp.*` sibling must be
-    // invisible to diffs and merges on every side.
-    fs::write(child.join(".rift.tmp.123"), "partial").unwrap();
-    fs::write(child.join("d/.rift.tmp.7"), "partial").unwrap();
-    fs::write(source.join(".rift.tmp.9"), "partial").unwrap();
+    // Crash debris from an earlier apply: a `.rift.tmp.<pid>.…` sibling
+    // must be invisible to diffs and merges on every side.
+    fs::write(
+        child.join(".rift.tmp.123.1.0123456789abcdef.partial"),
+        "partial",
+    )
+    .unwrap();
+    fs::write(child.join("d/.rift.tmp.7.2.0123456789abcdef.x"), "partial").unwrap();
+    fs::write(source.join(".rift.tmp.9.partial"), "partial").unwrap();
     fs::write(child.join("file.txt"), "edited").unwrap();
     fs::write(child.join("d/new.txt"), "new").unwrap();
 
@@ -548,17 +552,53 @@ fn inflight_copy_temps_are_invisible_and_never_left_behind() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy();
         assert!(
-            name == ".rift.tmp.9" || !name.contains(".rift.tmp"),
+            name == ".rift.tmp.9.partial" || !name.contains(".rift.tmp"),
             "temp leaked: {}",
             entry.path().display()
         );
     }
     // The parent-side leftover stays put but stays invisible.
     assert_eq!(
-        fs::read_to_string(source.join(".rift.tmp.9")).unwrap(),
+        fs::read_to_string(source.join(".rift.tmp.9.partial")).unwrap(),
         "partial"
     );
     assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+#[test]
+fn user_files_prefixed_rift_tmp_are_visible_content() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    // These names share the internal prefix but not the temp-file shape:
+    // they are ordinary content, copied into rifts and merged normally.
+    fs::write(source.join(".rift.tmp.keep"), "keep").unwrap();
+    fs::create_dir(source.join(".rift.tmp.d")).unwrap();
+    fs::write(source.join(".rift.tmp.d/inner.txt"), "inner").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(child.join(".rift.tmp.keep")).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join(".rift.tmp.d/inner.txt")).unwrap(),
+        "inner"
+    );
+
+    fs::write(child.join(".rift.tmp.keep"), "edited").unwrap();
+    fs::write(child.join(".rift.tmp.d/inner.txt"), "edited").unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(
+        fs::read_to_string(source.join(".rift.tmp.keep")).unwrap(),
+        "edited"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join(".rift.tmp.d/inner.txt")).unwrap(),
+        "edited"
+    );
 }
 
 #[test]

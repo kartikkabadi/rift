@@ -17,9 +17,7 @@ impl CopyFilter {
         parts.iter().any(|part| excludes_component(part))
             // `.rift.tmp*`: in-flight writes — the marker's atomic temp
             // and `apply_diff`'s per-file copy temps; a crash leaves them.
-            || parts
-                .iter()
-                .any(|part| part.as_encoded_bytes().starts_with(b".rift.tmp"))
+            || parts.iter().any(|part| crate::diff::is_temp_name(part))
             || parts.windows(2).any(|parts| {
                 matches_yarn_artifact(parts[0], parts[1])
                     || matches_git_artifact(parts[0], parts[1])

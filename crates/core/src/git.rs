@@ -56,8 +56,8 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
     };
-    // `/.rift` anchors the root marker; `/.rift.tmp` hides the temp file an
-    // interrupted atomic marker write can leave behind.
+    // `/.rift` anchors the root marker; `.rift.tmp*` hides the temp files
+    // interrupted atomic writes can leave behind, at any depth.
     if existing
         .lines()
         .any(|line| line.trim_end_matches(' ') == "/.rift")
@@ -71,7 +71,7 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
     };
     fs::write(
         exclude,
-        format!("{existing}{separator}/.rift\n/.rift.tmp\n"),
+        format!("{existing}{separator}/.rift\n.rift.tmp*\n"),
     )?;
     Ok(())
 }
@@ -192,24 +192,24 @@ mod tests {
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "/.rift\n/.rift.tmp\n"
+            "/.rift\n.rift.tmp*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), "existing").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n/.rift.tmp\n"
+            "existing\n/.rift\n.rift.tmp*\n"
         );
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n/.rift.tmp\n"
+            "existing\n/.rift\n.rift.tmp*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), " /.rift\n").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            " /.rift\n/.rift\n/.rift.tmp\n"
+            " /.rift\n/.rift\n.rift.tmp*\n"
         );
     }
 
