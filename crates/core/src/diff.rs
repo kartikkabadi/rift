@@ -120,12 +120,7 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
                     fs::set_permissions(&destination, permissions)?;
                 }
             }
-            fs::copy(&source, &destination)?;
-            portable::copy_metadata(
-                &source,
-                &destination,
-                portable::MetadataTarget::FileOrDirectory,
-            )?;
+            copy_file(&source, &destination)?;
         } else if file_type.is_symlink() {
             if existing.is_some() {
                 remove_path(&destination)?;
@@ -182,6 +177,37 @@ fn check_container_chain(root: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Writes `destination` atomically: the copy lands in a sibling temp file
+/// and is renamed over the target inside the same directory — atomic on
+/// every filesystem, so a mid-write crash leaves a hidden `.rift.tmp`
+/// leftover rather than a truncated file at the real path. The temp name
+/// is namespaced to rift and unique per destination; a stale leftover is
+/// safe to overwrite.
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::Path(format!("path has no parent: {}", destination.display())))?;
+    let name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let temporary = parent.join(format!(".rift.tmp.{}.{}", std::process::id(), name));
+    let result = fs::copy(source, &temporary)
+        .map_err(Error::from)
+        .and_then(|_| {
+            portable::copy_metadata(
+                source,
+                &temporary,
+                portable::MetadataTarget::FileOrDirectory,
+            )
+        })
+        .and_then(|_| fs::rename(&temporary, destination).map_err(Error::from));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -267,15 +293,21 @@ impl Entry {
 }
 
 /// Path components that never participate in diffs or lands: git internals
-/// (workspaces land git state through git, never file replay) and rift's
-/// own storage directories, which can sit inside a workspace that hosts
-/// another workspace family.
+/// (workspaces land git state through git, never file replay), rift's own
+/// storage directories, which can sit inside a workspace that hosts
+/// another workspace family, and `.rift.tmp*` debris — the marker's
+/// in-flight write and `apply_diff`'s per-file copy temps, which a crash
+/// can leave behind.
 pub(crate) fn is_internal(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
             component,
             std::path::Component::Normal(name)
-                if name == ".git" || name == ".rifts" || name == ".trash" || name == ".rifts-images"
+                if name == ".git"
+                    || name == ".rifts"
+                    || name == ".trash"
+                    || name == ".rifts-images"
+                    || name.as_encoded_bytes().starts_with(b".rift.tmp")
         )
     })
 }

@@ -518,6 +518,50 @@ fn land_never_writes_through_a_symlinked_directory() {
 }
 
 #[test]
+fn inflight_copy_temps_are_invisible_and_never_left_behind() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("d")).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    // Crash debris from an earlier apply: a `.rift.tmp.*` sibling must be
+    // invisible to diffs and merges on every side.
+    fs::write(child.join(".rift.tmp.123"), "partial").unwrap();
+    fs::write(child.join("d/.rift.tmp.7"), "partial").unwrap();
+    fs::write(source.join(".rift.tmp.9"), "partial").unwrap();
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    fs::write(child.join("d/new.txt"), "new").unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "edited"
+    );
+    assert_eq!(fs::read_to_string(source.join("d/new.txt")).unwrap(), "new");
+
+    // No temp file landed, and apply left none of its own behind — only
+    // the deliberately planted pre-existing leftover may remain.
+    for entry in walkdir::WalkDir::new(&source) {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy();
+        assert!(
+            name == ".rift.tmp.9" || !name.contains(".rift.tmp"),
+            "temp leaked: {}",
+            entry.path().display()
+        );
+    }
+    // The parent-side leftover stays put but stays invisible.
+    assert_eq!(
+        fs::read_to_string(source.join(".rift.tmp.9")).unwrap(),
+        "partial"
+    );
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+#[test]
 fn case_folded_name_collisions_report_a_conflict() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);

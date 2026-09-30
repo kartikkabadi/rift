@@ -15,6 +15,11 @@ impl CopyFilter {
             .collect::<Vec<_>>();
 
         parts.iter().any(|part| excludes_component(part))
+            // `.rift.tmp*`: in-flight writes — the marker's atomic temp
+            // and `apply_diff`'s per-file copy temps; a crash leaves them.
+            || parts
+                .iter()
+                .any(|part| part.as_encoded_bytes().starts_with(b".rift.tmp"))
             || parts.windows(2).any(|parts| {
                 matches_yarn_artifact(parts[0], parts[1])
                     || matches_git_artifact(parts[0], parts[1])
@@ -30,8 +35,6 @@ fn excludes_component(part: &OsStr) -> bool {
         ".rifts",
         ".trash",
         ".rifts-images",
-        // The marker's in-flight temp file; a crash can leave it behind.
-        ".rift.tmp",
         ".pnpm-store",
         "target",
         ".venv",
