@@ -444,7 +444,9 @@ impl Entry {
 /// the prefix is ordinary user content and stays visible to manifests
 /// and merges. Residual ambiguity: a user file named exactly like a
 /// generated temp (pid, seq, 16-hex field) is indistinguishable from
-/// real debris and stays hidden — while the oldest `.rift.tmp.<pid>.
+/// real debris and stays hidden (a *directory* at that shape hides its
+/// whole subtree, since `is_internal` checks every component) — while
+/// the oldest `.rift.tmp.<pid>.
 /// <name>` form (two fields, no random) collides with plausible user
 /// names like `.rift.tmp.123.notes` and is therefore content.
 pub(crate) fn is_temp_name(name: &OsStr) -> bool {

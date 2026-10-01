@@ -778,34 +778,44 @@ impl Manager {
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> Result<Vec<PathBuf>> {
-                    let storage = match default_storage(&root.path) {
-                        Ok(storage) => storage,
-                        Err(_) => return Ok(Vec::new()),
-                    };
-                    if !storage.is_dir() {
-                        return Ok(Vec::new());
-                    }
                     let mut swept = Vec::new();
-                    for entry in fs::read_dir(&storage)? {
-                        let entry = entry?;
-                        let candidate = entry.path();
-                        let is_directory = entry
-                            .file_type()
-                            .map(|file_type| file_type.is_dir())
-                            .unwrap_or(false);
-                        // Internal folders (`.trash`, nested `.rifts`) belong
-                        // to rift itself, not to any registry row.
-                        if !is_directory || crate::diff::is_internal(Path::new(&entry.file_name()))
-                        {
-                            continue;
+                    if let Ok(storage) = default_storage(&root.path)
+                        && storage.is_dir()
+                    {
+                        for entry in fs::read_dir(&storage)? {
+                            let entry = entry?;
+                            let candidate = entry.path();
+                            let is_directory = entry
+                                .file_type()
+                                .map(|file_type| file_type.is_dir())
+                                .unwrap_or(false);
+                            // Internal folders (`.trash`, nested `.rifts`) belong
+                            // to rift itself, not to any registry row.
+                            if !is_directory
+                                || crate::diff::is_internal(Path::new(&entry.file_name()))
+                            {
+                                continue;
+                            }
+                            // Checked inside the lock, so a `create` that just
+                            // committed is never swept.
+                            if self.registry.record_at(&candidate)?.is_some() {
+                                continue;
+                            }
+                            self.strategy.remove_directory(&candidate)?;
+                            swept.push(candidate);
                         }
-                        // Checked inside the lock, so a `create` that just
-                        // committed is never swept.
-                        if self.registry.record_at(&candidate)?.is_some() {
-                            continue;
-                        }
-                        self.strategy.remove_directory(&candidate)?;
-                        swept.push(candidate);
+                    }
+                    // `.rift.tmp*` debris is invisible to diffs and git,
+                    // so nothing else ever removes it. The family lock is
+                    // held here, so every temp still on disk belongs to a
+                    // dead operation; the age bound covers the stale-lock
+                    // edge (a live apply's temp is never old).
+                    let cutoff = std::time::SystemTime::now() - TEMP_DEBRIS_MIN_AGE;
+                    for record in self
+                        .registry
+                        .subtree(&root.id, SubtreeScope::IncludingRoot)?
+                    {
+                        sweep_temp_debris(&record.path, cutoff, &mut swept);
                     }
                     Ok(swept)
                 },
@@ -946,7 +956,7 @@ impl Manager {
                 {
                     entries.push(forced);
                 }
-                merge::set_resolved(&mut next_base.entries, &conflict);
+                merge::set_resolved(&mut next_base.entries, &conflict, next_slots.as_mut());
             } else {
                 conflicts.push(conflict.entry);
             }
@@ -1116,6 +1126,48 @@ fn trash_path(id: &RiftId, path: &Path) -> Result<PathBuf> {
     Ok(parent
         .join(".trash")
         .join(format!("{id}-{}", name.to_string_lossy())))
+}
+
+/// How old a `.rift.tmp*` leftover must be before `gc` sweeps it: every
+/// legitimate temp is created, written, and renamed within seconds, so
+/// anything past an hour can only be crash debris.
+const TEMP_DEBRIS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Best-effort sweep of stale apply/marker temps inside `workspace`,
+/// called by `gc` with the family lock held. Only `is_temp_name` files
+/// older than `cutoff` go; directories are never removed (the generators
+/// only make files, so a temp-named directory is user content), and
+/// internal/copy-filtered subtrees are not descended. Failures are
+/// skipped rather than reported — debris cleanup must not fail `gc`.
+fn sweep_temp_debris(workspace: &Path, cutoff: std::time::SystemTime, swept: &mut Vec<PathBuf>) {
+    if !workspace.is_dir() {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(workspace)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            entry
+                .path()
+                .strip_prefix(workspace)
+                .is_ok_and(|path| !diff::is_internal(path) && !filter::CopyFilter.excludes(path))
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_dir() || !diff::is_temp_name(entry.file_name()) {
+            continue;
+        }
+        let stale = fs::symlink_metadata(entry.path())
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|mtime| mtime < cutoff);
+        if stale && fs::remove_file(entry.path()).is_ok() {
+            swept.push(entry.path().to_path_buf());
+        }
+    }
 }
 
 #[cfg(test)]

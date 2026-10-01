@@ -1781,3 +1781,69 @@ fn a_doubled_base_slot_reports_its_conflict_once() {
         .count();
     assert_eq!(hits, 1, "{paths:?}");
 }
+
+/// `gc` removes `.rift.tmp.*` crash debris — invisible to diffs and git,
+/// so nothing else ever cleans it — but only once it is old enough to be
+/// wreckage, never a live apply's in-flight temp.
+#[test]
+fn gc_sweeps_stale_apply_temps_and_keeps_fresh_ones() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    let stale = source.join(".rift.tmp.1.0.0123456789abcdef");
+    let stale_nested = source.join("sub/.rift.tmp.2.0.0123456789abcdef");
+    let stale_in_rift = child.join(".rift.tmp.3.0.0123456789abcdef");
+    let fresh = source.join(".rift.tmp.4.0.0123456789abcdef");
+    let lookalike = source.join(".rift.tmp.123.notes");
+    fs::create_dir(source.join("sub")).unwrap();
+    for path in [&stale, &stale_nested, &stale_in_rift, &fresh, &lookalike] {
+        fs::write(path, "partial").unwrap();
+    }
+    let old =
+        filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() - 2 * 3600, 0);
+    for path in [&stale, &stale_nested, &stale_in_rift, &lookalike] {
+        filetime::set_file_times(path, old, old).unwrap();
+    }
+
+    let removed = manager.gc().unwrap();
+
+    assert!(removed.contains(&stale));
+    assert!(removed.contains(&stale_nested));
+    assert!(removed.contains(&stale_in_rift));
+    assert!(!stale.exists());
+    assert!(!stale_nested.exists());
+    assert!(!stale_in_rift.exists());
+    // A temp young enough to belong to a live write, and a name that only
+    // shares the prefix, both survive.
+    assert!(fresh.exists());
+    assert!(lookalike.exists());
+}
+
+/// A family whose merge lock is held has a live operation somewhere: its
+/// temps — however old — are left for the next pass.
+#[test]
+fn gc_never_sweeps_temps_while_the_family_is_locked() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let root = manager.workspace_at(&source).unwrap();
+
+    let stale = source.join(".rift.tmp.1.0.0123456789abcdef");
+    fs::write(&stale, "partial").unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000, 0);
+    filetime::set_file_times(&stale, old, old).unwrap();
+
+    assert!(manager.registry.lock_root(&root.id).unwrap());
+    manager.gc().unwrap();
+    assert!(stale.exists());
+
+    manager.registry.unlock_root(&root.id).unwrap();
+    manager.gc().unwrap();
+    assert!(!stale.exists());
+}
