@@ -1,4 +1,7 @@
-use crate::{CopyMode, Create, CreateOptions, Error, HookMode, Manager, RemoveOptions};
+use crate::{
+    CopyMode, CowMode, Create, CreateOptions, Error, HookMode, LandOptions, LandOutcome, Manager,
+    OnConflict, Probe, RemoveOptions, TreeDiff,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -14,6 +17,10 @@ struct Request {
 enum Command {
     Init {
         at: PathBuf,
+        #[serde(rename = "cowOnly")]
+        cow_only: Option<bool>,
+        #[serde(rename = "cowImage")]
+        cow_image: Option<bool>,
     },
     Create {
         from: PathBuf,
@@ -22,6 +29,11 @@ enum Command {
         #[serde(rename = "copyAll")]
         copy_all: Option<bool>,
         hooks: Option<bool>,
+        #[serde(rename = "cowOnly")]
+        cow_only: Option<bool>,
+    },
+    Doctor {
+        of: PathBuf,
     },
     Remove {
         at: PathBuf,
@@ -37,6 +49,23 @@ enum Command {
     Ancestors {
         of: PathBuf,
     },
+    Diff {
+        at: PathBuf,
+    },
+    Land {
+        at: PathBuf,
+        #[serde(rename = "onConflict")]
+        on_conflict: Option<OnConflict>,
+        #[serde(rename = "filesOnly")]
+        files_only: Option<bool>,
+    },
+    Sync {
+        at: PathBuf,
+        #[serde(rename = "onConflict")]
+        on_conflict: Option<OnConflict>,
+        #[serde(rename = "filesOnly")]
+        files_only: Option<bool>,
+    },
     Gc,
 }
 
@@ -44,8 +73,14 @@ enum Command {
 #[serde(untagged)]
 enum Value {
     Empty(()),
+    #[serde(serialize_with = "crate::diff::serialize_path")]
     Path(PathBuf),
+    #[serde(serialize_with = "crate::diff::serialize_paths")]
     Paths(Vec<PathBuf>),
+    Report(Probe),
+    Diff(TreeDiff),
+    Merge(LandOutcome),
+    Init(crate::InitOutcome),
 }
 
 #[derive(Serialize)]
@@ -59,7 +94,10 @@ enum Response {
 struct Failure {
     code: &'static str,
     message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::diff::serialize_path_option"
+    )]
     path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hook: Option<String>,
@@ -104,6 +142,12 @@ impl From<Error> for Failure {
             Error::OverlappingWorkspace(path) => ("inside_source", Some(path.clone())),
             Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
+            Error::CowImageSetup(_) => ("cow_image_setup", None),
+            Error::NoParent { path, .. } => ("no_parent", Some(path.clone())),
+            Error::UseGit(path) => ("use_git", Some(path.clone())),
+            Error::LandConflict { path, .. } => ("land_conflict", Some(path.clone())),
+            Error::Locked(path) => ("locked", Some(path.clone())),
+            Error::CorruptBase(_) => ("corrupt_base", None),
         };
         let (hook, committed) = match &error {
             Error::HookFailed { hook, .. } => (
@@ -139,6 +183,21 @@ pub fn error(code: &'static str, message: impl Into<String>) -> String {
     })
 }
 
+fn cow_mode(cow_only: Option<bool>) -> CowMode {
+    if cow_only.unwrap_or(false) {
+        CowMode::Require
+    } else {
+        CowMode::Auto
+    }
+}
+
+fn land_options(on_conflict: Option<OnConflict>, files_only: Option<bool>) -> LandOptions {
+    LandOptions {
+        on_conflict: on_conflict.unwrap_or_default(),
+        files_only: files_only.unwrap_or(false),
+    }
+}
+
 fn serialize(response: Response) -> String {
     serde_json::to_string(&response).unwrap_or_else(|_| {
         r#"{"status":"error","error":{"code":"serialization","message":"failed to serialize response"}}"#
@@ -154,16 +213,26 @@ fn execute(input: &str) -> Result<Value, Failure> {
         .map_or_else(Manager::open_default, Manager::open)
         .map_err(Failure::from)?;
     match request.command {
-        Command::Init { at } => manager
-            .init(at)
-            .map(|_| Value::Empty(()))
-            .map_err(Failure::from),
+        Command::Init {
+            at,
+            cow_only,
+            cow_image,
+        } => {
+            if cow_image.unwrap_or(false) {
+                crate::cow_image::setup(&at).map_err(Failure::from)?;
+            }
+            manager
+                .init_with_cow_mode(at, cow_mode(cow_only), |_| {})
+                .map(Value::Init)
+                .map_err(Failure::from)
+        }
         Command::Create {
             from,
             name,
             into,
             copy_all,
             hooks,
+            cow_only,
         } => manager
             .create_with_options(
                 Create::new(from).with_name(name).with_storage(into),
@@ -177,10 +246,12 @@ fn execute(input: &str) -> Result<Value, Failure> {
                         HookMode::Run
                     } else {
                         HookMode::Skip
-                    }),
+                    })
+                    .cow_mode(cow_mode(cow_only)),
             )
             .map(Value::Path)
             .map_err(Failure::from),
+        Command::Doctor { of } => manager.probe(of).map(Value::Report).map_err(Failure::from),
         Command::Remove { at, all, hooks } => {
             let options = RemoveOptions::default().hook_mode(if hooks.unwrap_or(true) {
                 HookMode::Run
@@ -208,6 +279,23 @@ fn execute(input: &str) -> Result<Value, Failure> {
             .ancestors(of)
             .map(Value::Paths)
             .map_err(Failure::from),
+        Command::Diff { at } => manager.diff(at).map(Value::Diff).map_err(Failure::from),
+        Command::Land {
+            at,
+            on_conflict,
+            files_only,
+        } => manager
+            .land_with_options(at, land_options(on_conflict, files_only))
+            .map(Value::Merge)
+            .map_err(Failure::from),
+        Command::Sync {
+            at,
+            on_conflict,
+            files_only,
+        } => manager
+            .sync_with_options(at, land_options(on_conflict, files_only))
+            .map(Value::Merge)
+            .map_err(Failure::from),
         Command::Gc => manager.gc().map(Value::Paths).map_err(Failure::from),
     }
 }
@@ -215,6 +303,7 @@ fn execute(input: &str) -> Result<Value, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ConflictEntry, DiffEntry, DiffKind};
 
     #[test]
     fn serializes_errors_with_structured_hook_state() {
@@ -245,7 +334,7 @@ mod tests {
     #[test]
     fn accepts_create_and_remove_options() {
         let create = serde_json::from_str::<Request>(
-            r#"{"command":"create","from":"/tmp/app","copyAll":true,"hooks":false}"#,
+            r#"{"command":"create","from":"/tmp/app","copyAll":true,"hooks":false,"cowOnly":true}"#,
         )
         .unwrap();
         let remove = serde_json::from_str::<Request>(
@@ -258,6 +347,7 @@ mod tests {
             Command::Create {
                 copy_all: Some(true),
                 hooks: Some(false),
+                cow_only: Some(true),
                 ..
             }
         ));
@@ -269,5 +359,103 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn accepts_land_and_sync_merge_options() {
+        let land = serde_json::from_str::<Request>(
+            r#"{"command":"land","at":"/tmp/app","onConflict":"force","filesOnly":true}"#,
+        )
+        .unwrap();
+        let sync =
+            serde_json::from_str::<Request>(r#"{"command":"sync","at":"/tmp/app"}"#).unwrap();
+
+        assert!(matches!(
+            land.command,
+            Command::Land {
+                on_conflict: Some(OnConflict::Force),
+                files_only: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            sync.command,
+            Command::Sync {
+                on_conflict: None,
+                files_only: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accepts_init_cow_only_and_doctor() {
+        let init =
+            serde_json::from_str::<Request>(r#"{"command":"init","at":"/tmp/app","cowOnly":true}"#)
+                .unwrap();
+        let doctor =
+            serde_json::from_str::<Request>(r#"{"command":"doctor","of":"/tmp/app"}"#).unwrap();
+
+        assert!(matches!(
+            init.command,
+            Command::Init {
+                cow_only: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(doctor.command, Command::Doctor { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_serialize_lossily_instead_of_failing() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // serde cannot serialize a non-UTF-8 PathBuf; the wire form is a
+        // string with U+FFFD markers so the response — and the completed
+        // land outcome it carries — survives.
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"conflict-\xff.txt"));
+        let outcome = crate::LandOutcome {
+            applied: crate::TreeDiff {
+                from: PathBuf::from("/tmp/parent"),
+                to: PathBuf::from("/tmp/rift"),
+                entries: vec![DiffEntry {
+                    path: path.clone(),
+                    kind: DiffKind::Changed,
+                }],
+            },
+            conflicts: vec![ConflictEntry {
+                path: path.clone(),
+                ours: DiffKind::Changed,
+                theirs: DiffKind::Changed,
+            }],
+        };
+        let response = serde_json::to_string(&Response::Ok {
+            value: Value::Merge(outcome),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(
+            value["value"]["conflicts"][0]["path"],
+            "conflict-\u{FFFD}.txt"
+        );
+        assert_eq!(
+            value["value"]["applied"]["entries"][0]["path"],
+            "conflict-\u{FFFD}.txt"
+        );
+
+        // Same for the error wire: a non-UTF-8 path inside a Failure must
+        // not collapse the error itself into a serialization failure.
+        let failure = serde_json::to_string(&Response::Error {
+            error: Failure::from(Error::IoAt {
+                operation: "copy",
+                path: path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+            }),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&failure).unwrap();
+        assert_eq!(value["error"]["path"], "conflict-\u{FFFD}.txt");
     }
 }

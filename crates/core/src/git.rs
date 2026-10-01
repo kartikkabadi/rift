@@ -56,18 +56,28 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
     };
-    if existing
+    // `/.rift` anchors the root marker; `.rift.tmp` and the fielded
+    // `.rift.tmp.*.*.*` glob hide the temp names `is_temp_name` produces,
+    // at any depth. Git's glob cannot check the field contents, so a user
+    // file like `.rift.tmp.a.b.c` is still hidden here while rift counts
+    // it as content — a deliberate one-sided divergence narrower than the
+    // old `.rift.tmp*` glob, which also hid real user files.
+    let mut lines = existing
         .lines()
-        .any(|line| line.trim_end_matches(' ') == "/.rift")
-    {
+        .filter(|line| line.trim_end_matches(' ') != ".rift.tmp*")
+        .collect::<Vec<_>>();
+    for wanted in ["/.rift", ".rift.tmp", ".rift.tmp.*.*.*"] {
+        if !lines
+            .iter()
+            .any(|line| line.trim_end_matches(' ') == wanted)
+        {
+            lines.push(wanted);
+        }
+    }
+    if lines == existing.lines().collect::<Vec<_>>() {
         return Ok(());
     }
-    let separator = if existing.is_empty() || existing.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    fs::write(exclude, format!("{existing}{separator}/.rift\n"))?;
+    fs::write(exclude, format!("{}\n", lines.join("\n")))?;
     Ok(())
 }
 
@@ -91,6 +101,55 @@ pub(crate) fn detach_destination(path: &Path) -> Result<()> {
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     fs::write(path.join(".git").join("HEAD"), format!("{commit}\n"))?;
     Ok(())
+}
+
+/// Clears the read-only bit on files under `.git`. Windows refuses to modify
+/// read-only files, and a plain copy preserves the attributes Git sets on its
+/// objects, which would block the post-copy fixup and later `git` commands.
+#[cfg(windows)]
+pub(crate) fn make_writable(path: &Path) -> Result<()> {
+    let git = path.join(".git");
+    if !git.is_dir() {
+        return Ok(());
+    }
+    // Objects stay read-only: they are immutable and never modified in place,
+    // so keeping Git's read-only convention also keeps `diff` honest.
+    let objects = git.join("objects");
+    for entry in walkdir::WalkDir::new(&git).min_depth(1) {
+        let entry = entry?;
+        if !entry.file_type().is_file() || entry.path().starts_with(&objects) {
+            continue;
+        }
+        let mut permissions = entry.metadata()?.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(entry.path(), permissions)?;
+        }
+    }
+    Ok(())
+}
+
+/// The commit `.git/HEAD` points at — the hash for a detached HEAD, or the
+/// ref it names resolved through loose refs or `packed-refs`. `None` when
+/// HEAD cannot be resolved (unborn branch, no `.git`, odd layout). Recorded
+/// in the base manifest as provenance; it never participates in merges.
+pub(crate) fn head_commit(workspace: &Path) -> Option<String> {
+    let head = fs::read_to_string(workspace.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ") else {
+        return Some(head.to_owned());
+    };
+    let reference = reference.trim();
+    if let Ok(hash) = fs::read_to_string(workspace.join(".git").join(reference)) {
+        return Some(hash.trim().to_owned());
+    }
+    fs::read_to_string(workspace.join(".git").join("packed-refs"))
+        .ok()?
+        .lines()
+        .find(|line| line.ends_with(&format!(" {reference}")))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -138,24 +197,37 @@ mod tests {
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "/.rift\n"
+            "/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), "existing").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n"
+            "existing\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n"
+            "existing\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), " /.rift\n").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            " /.rift\n/.rift\n"
+            " /.rift\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
+        );
+        // A workspace an older build hid its temps behind the broad
+        // `.rift.tmp*` glob is narrowed to the shapes rift produces —
+        // user files that merely share the prefix are git-visible again.
+        fs::write(
+            temp.path().join(".git/info/exclude"),
+            "/.rift\n.rift.tmp*\n",
+        )
+        .unwrap();
+        hide_marker(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
+            "/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
     }
 

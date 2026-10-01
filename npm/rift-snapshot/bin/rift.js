@@ -5,6 +5,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { createRequire } from "node:module"
 
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
@@ -14,10 +15,25 @@ if (!platform || !arch) {
   process.exit(1)
 }
 
+// Static musl builds run on any Linux, so when libc cannot be identified
+// musl is the safe guess: a glibc binary would not start on musl at all.
+const report = process.report?.getReport?.()
+const musl =
+  platform === "linux" &&
+  (report ? report.header?.glibcVersionRuntime === undefined : fs.existsSync("/etc/alpine-release"))
+const flavor = musl ? "linux-musl" : platform
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const binary = path.join(root, "prebuilds", `${platform}-${arch}`, platform === "windows" ? "rift.exe" : "rift")
+// Prefer the installed per-platform package; fall back to the bundled
+// prebuilds shipped inside the launcher package itself.
+const require = createRequire(import.meta.url)
+let directory = path.join(root, "prebuilds", `${flavor}-${arch}`)
+try {
+  directory = path.dirname(require.resolve(`rift-snapshot-${flavor}-${arch}/package.json`))
+} catch {}
+const binary = path.join(directory, platform === "windows" ? "rift.exe" : "rift")
 if (!fs.existsSync(binary)) {
-  console.error(`Unable to locate the Rift binary for ${platform}-${arch}. Reinstall rift-snapshot.`)
+  console.error(`Unable to locate the Rift binary for ${flavor}-${arch}. Reinstall rift-snapshot.`)
   process.exit(1)
 }
 

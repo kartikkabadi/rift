@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rift::{CopyMode, Create, CreateOptions, HookMode, InitProgress, Manager, RemoveOptions};
+use rift::{
+    Backend, CopyMode, CowMode, Create, CreateOptions, HookMode, InitProgress, LandOptions,
+    Manager, OnConflict, RemoveOptions,
+};
 use std::io::Read;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -16,6 +19,11 @@ enum CliError {
         "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
     )]
     ForceRequired,
+    /// Clean paths were applied but conflicting paths remain; exits 2.
+    #[error(
+        "conflicting path(s) were not applied; resolve them and rerun, or rerun with --on-conflict force to take the incoming version"
+    )]
+    Conflicts,
 }
 
 #[derive(Parser)]
@@ -30,10 +38,29 @@ struct Cli {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum ConflictMode {
+    Report,
+    Abort,
+    Force,
+}
+
+impl From<ConflictMode> for OnConflict {
+    fn from(mode: ConflictMode) -> Self {
+        match mode {
+            ConflictMode::Report => OnConflict::Report,
+            ConflictMode::Abort => OnConflict::Abort,
+            ConflictMode::Force => OnConflict::Force,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum Shell {
     Bash,
     Zsh,
     Nushell,
+    Fish,
+    Powershell,
 }
 
 impl Shell {
@@ -78,6 +105,39 @@ impl Shell {
 }}"#,
                 )
             }
+            Shell::Fish => {
+                let executable = fish_shell_quote(executable);
+                format!(
+                    r#"function rift
+  if test (count $argv) -gt 0; and contains -- $argv[1] init create remove
+    set -l __rift_cwd ({executable} --shell-cwd $argv | string collect)
+    set -l __rift_status $status
+    if test -n "$__rift_cwd"
+      builtin cd -- "$__rift_cwd"; or return $status
+    end
+    return $__rift_status
+  end
+  {executable} $argv
+end"#,
+                )
+            }
+            Shell::Powershell => {
+                let executable = powershell_shell_quote(executable);
+                format!(
+                    r#"function rift {{
+  $command = if ($args.Count -gt 0) {{ [string]$args[0] }} else {{ "" }}
+  if ($command -in 'init', 'create', 'remove') {{
+    $output = & {executable} --shell-cwd @args | Out-String
+    $status = $LASTEXITCODE
+    $cwd = $output.Trim()
+    if ($cwd) {{ Set-Location -LiteralPath $cwd }}
+    $global:LASTEXITCODE = $status
+    return
+  }}
+  & {executable} @args
+}}"#,
+                )
+            }
         }
     }
 }
@@ -94,6 +154,15 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         here: bool,
+        /// Fail instead of falling back to a regular copy when the filesystem
+        /// cannot copy-on-write.
+        #[arg(long)]
+        cow_only: bool,
+        /// Linux only: when the filesystem cannot copy-on-write, create and
+        /// mount a fast virtual disk next to the workspace and move the
+        /// workspace into it. Requires root or sudo.
+        #[arg(long)]
+        cow_image: bool,
     },
     Create {
         from: Option<PathBuf>,
@@ -105,6 +174,17 @@ enum Command {
         copy_all: bool,
         #[arg(long)]
         no_hooks: bool,
+        /// Fail instead of falling back to a regular copy when the filesystem
+        /// cannot copy-on-write.
+        #[arg(long)]
+        cow_only: bool,
+    },
+    /// Report what this machine supports: filesystem, copy method, and
+    /// whether new rifts will be instant or regular copies.
+    Doctor {
+        of: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     Remove {
         at: Option<PathBuf>,
@@ -121,6 +201,45 @@ enum Command {
     Ancestors {
         of: Option<PathBuf>,
     },
+    /// Show which files changed inside this rift compared to the workspace
+    /// it was copied from.
+    Diff {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply this rift's changes back into the workspace it was copied from,
+    /// then keep working in the rift or `rift remove` it.
+    Land {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// What to do when both workspaces changed the same path: report
+        /// applies clean paths and lists conflicts (exit 2), abort writes
+        /// nothing, force takes the incoming version.
+        #[arg(long, value_enum, default_value_t = ConflictMode::Report)]
+        on_conflict: ConflictMode,
+        /// Merge only working-tree files; required when the workspaces live
+        /// in a Git repository, where `.git` is never replayed.
+        #[arg(long)]
+        files_only: bool,
+    },
+    /// Pull the source workspace's latest files into this rift (the reverse
+    /// of `rift land`).
+    Sync {
+        at: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// What to do when both workspaces changed the same path: report
+        /// applies clean paths and lists conflicts (exit 2), abort writes
+        /// nothing, force takes the incoming version.
+        #[arg(long, value_enum, default_value_t = ConflictMode::Report)]
+        on_conflict: ConflictMode,
+        /// Merge only working-tree files; required when the workspaces live
+        /// in a Git repository, where `.git` is never replayed.
+        #[arg(long)]
+        files_only: bool,
+    },
     Gc,
 }
 
@@ -131,7 +250,10 @@ fn main() {
             _ => error.to_string(),
         };
         eprintln!("{message}");
-        std::process::exit(1);
+        std::process::exit(match error {
+            CliError::Conflicts => 2,
+            _ => 1,
+        });
     }
 }
 
@@ -145,6 +267,9 @@ fn error_message(error: &rift::Error) -> String {
         }
         rift::Error::MissingMarker(_) => {
             "this workspace is missing its `.rift` marker; run `rift init` to restore it".into()
+        }
+        rift::Error::NoParent { .. } => {
+            "this is the root workspace; it has no source to diff, land, or sync against".into()
         }
         _ => error.to_string(),
     }
@@ -184,26 +309,54 @@ fn run() -> Result<()> {
             print_shell_init(shell);
             Ok(())
         }
-        Command::Init { at, here } => {
+        Command::Init {
+            at,
+            here,
+            cow_only,
+            cow_image,
+        } => {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
+            if cow_image && existing.is_none() {
+                match rift::cow_image::setup(&at)? {
+                    Some(image) => {
+                        eprintln!(
+                            "set up a {} virtual disk at {}; workspace moved to {}",
+                            image.filesystem,
+                            image.image.display(),
+                            image.project.display()
+                        );
+                        eprintln!(
+                            "the original was kept at {}; delete it once verified",
+                            image.backup.display()
+                        );
+                        for warning in &image.warnings {
+                            eprintln!("note: {warning}");
+                        }
+                    }
+                    None => eprintln!(
+                        "this filesystem already supports instant copies; --cow-image skipped"
+                    ),
+                }
+            }
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
             let mut converting = false;
-            let outcome = manager.init_with_progress(&at, |progress| match progress {
-                InitProgress::CreatingSubvolume => {
-                    converting = true;
-                    eprintln!("Initializing  {}\n", at.display());
-                    eprintln!("First-time setup can take a moment.");
-                    eprintln!("New rifts will be instant.\n");
-                    eprintln!("Creating BTRFS subvolume...");
-                }
-                InitProgress::ImportingWorkspace => eprintln!("Importing workspace..."),
-                InitProgress::ImportedEntries { .. } => {}
-                InitProgress::ActivatingWorkspace
-                | InitProgress::RegisteringWorkspace
-                | InitProgress::RestoringMarker
-                | InitProgress::RemovingOriginal => {}
-            })?;
+            let outcome =
+                manager.init_with_cow_mode(&at, cow_mode(cow_only), |progress| match progress {
+                    InitProgress::CreatingSubvolume => {
+                        converting = true;
+                        eprintln!("Initializing  {}\n", at.display());
+                        eprintln!("First-time setup can take a moment.");
+                        eprintln!("New rifts will be instant.\n");
+                        eprintln!("Creating BTRFS subvolume...");
+                    }
+                    InitProgress::ImportingWorkspace => eprintln!("Importing workspace..."),
+                    InitProgress::ImportedEntries { .. } => {}
+                    InitProgress::ActivatingWorkspace
+                    | InitProgress::RegisteringWorkspace
+                    | InitProgress::RestoringMarker
+                    | InitProgress::RemovingOriginal => {}
+                })?;
             if outcome.is_converted() {
                 if converting {
                     eprintln!("\nReady  {}", at.display());
@@ -227,6 +380,11 @@ fn run() -> Result<()> {
             } else {
                 eprintln!("Ready  {}", at.display());
             }
+            if outcome.is_degraded() {
+                eprintln!(
+                    "note: this filesystem cannot make instant copies; new rifts will be regular copies (slower, same result)"
+                );
+            }
             Ok(())
         }
         Command::Create {
@@ -235,6 +393,7 @@ fn run() -> Result<()> {
             into,
             copy_all,
             no_hooks,
+            cow_only,
         } => {
             let destination = manager.create_with_options(
                 Create::new(from.unwrap_or(std::env::current_dir()?))
@@ -250,7 +409,8 @@ fn run() -> Result<()> {
                         HookMode::Skip
                     } else {
                         HookMode::Run
-                    }),
+                    })
+                    .cow_mode(cow_mode(cow_only)),
             )?;
             if cli.shell_cwd {
                 eprintln!("created {}", destination.display());
@@ -342,12 +502,146 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Command::Doctor { of, json } => {
+            let probe = manager.probe(of.unwrap_or(std::env::current_dir()?))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&probe).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                let filesystem = probe.filesystem.as_deref().unwrap_or("unknown");
+                let method = match probe.backend {
+                    Backend::Btrfs => "instant copies (btrfs snapshots)",
+                    Backend::Reflink => "instant copies (Linux reflinks)",
+                    Backend::Apfs => "instant copies (APFS clonefile)",
+                    Backend::ReFs => "instant copies (ReFS block cloning)",
+                    Backend::Portable => {
+                        "regular copies only (no instant-copy support on this filesystem)"
+                    }
+                };
+                println!("{}", probe.path.display());
+                println!("filesystem: {filesystem}");
+                println!("copy method: {method}");
+                if matches!(probe.backend, Backend::Portable) {
+                    println!("tip: `rift init` still works; new rifts will just take longer");
+                    if cfg!(target_os = "linux") {
+                        println!(
+                            "tip: on Linux, `rift init --cow-image` sets up a fast virtual disk for instant copies (needs root)"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Diff { at, json } => {
+            let diff = manager.diff(at.unwrap_or(std::env::current_dir()?))?;
+            print_diff(&diff, json);
+            Ok(())
+        }
+        Command::Land {
+            at,
+            json,
+            on_conflict,
+            files_only,
+        } => {
+            let options = LandOptions::default()
+                .on_conflict(on_conflict.into())
+                .files_only(files_only);
+            let outcome =
+                manager.land_with_options(at.unwrap_or(std::env::current_dir()?), options)?;
+            print_outcome("landed", &outcome, json)
+        }
+        Command::Sync {
+            at,
+            json,
+            on_conflict,
+            files_only,
+        } => {
+            let options = LandOptions::default()
+                .on_conflict(on_conflict.into())
+                .files_only(files_only);
+            let outcome =
+                manager.sync_with_options(at.unwrap_or(std::env::current_dir()?), options)?;
+            print_outcome("synced", &outcome, json)
+        }
         Command::Gc => {
             for path in manager.gc()? {
                 println!("{}", path.display());
             }
             Ok(())
         }
+    }
+}
+
+/// Prints a land/sync outcome: the applied diff, each conflict, then the
+/// summary line. Conflicts exit 2 so scripts can react.
+fn print_outcome(verb: &str, outcome: &rift::LandOutcome, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(outcome).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        print_diff(&outcome.applied, json);
+        for conflict in &outcome.conflicts {
+            println!(
+                "C {} (this: {}, incoming: {})",
+                conflict.path.display(),
+                side(conflict.ours),
+                side(conflict.theirs)
+            );
+        }
+    }
+    eprintln!(
+        "{verb} {} change(s) into {}",
+        outcome.applied.entries.len(),
+        outcome.applied.from.display()
+    );
+    if outcome.conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::Conflicts)
+    }
+}
+
+fn side(kind: rift::DiffKind) -> &'static str {
+    match kind {
+        rift::DiffKind::Added => "added",
+        rift::DiffKind::Changed => "changed",
+        rift::DiffKind::Removed => "removed",
+    }
+}
+
+/// Prints a diff the way `git status --short` does: A added, M modified,
+/// D deleted.
+fn print_diff(diff: &rift::TreeDiff, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(diff).unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    if diff.is_clean() {
+        println!("no changes");
+        return;
+    }
+    for entry in &diff.entries {
+        let marker = match entry.kind {
+            rift::DiffKind::Added => "A",
+            rift::DiffKind::Changed => "M",
+            rift::DiffKind::Removed => "D",
+        };
+        println!("{marker} {}", entry.path.display());
+    }
+}
+
+fn cow_mode(cow_only: bool) -> CowMode {
+    if cow_only {
+        CowMode::Require
+    } else {
+        CowMode::Auto
     }
 }
 
@@ -396,6 +690,14 @@ fn nushell_shell_quote(value: &str) -> String {
         hashes.push('#');
     }
     format!("r{}'{}'{}", hashes, value, hashes)
+}
+
+fn fish_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn powershell_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -454,6 +756,7 @@ mod tests {
             "child",
             "--copy-all",
             "--no-hooks",
+            "--cow-only",
         ])
         .unwrap();
 
@@ -462,9 +765,28 @@ mod tests {
             Command::Create {
                 copy_all: true,
                 no_hooks: true,
+                cow_only: true,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn init_and_doctor_accept_strict_and_json_flags() {
+        let init =
+            Cli::try_parse_from(["rift", "init", "--here", "--cow-only", "--cow-image"]).unwrap();
+        let doctor = Cli::try_parse_from(["rift", "doctor", "--json"]).unwrap();
+
+        assert!(matches!(
+            init.command,
+            Command::Init {
+                here: true,
+                cow_only: true,
+                cow_image: true,
+                ..
+            }
+        ));
+        assert!(matches!(doctor.command, Command::Doctor { json: true, .. }));
     }
 
     #[test]
@@ -526,5 +848,43 @@ mod tests {
             nushell_shell_quote("/tmp/it's'#rift"),
             "r##'/tmp/it's'#rift'##"
         );
+    }
+
+    #[test]
+    fn shell_init_renders_fish_and_powershell_wrappers() {
+        let fish = Shell::Fish.init_script("/tmp/rift");
+        let powershell = Shell::Powershell.init_script("/tmp/rift");
+
+        assert!(fish.contains("function rift"));
+        assert!(fish.contains("--shell-cwd $argv"));
+        assert!(fish.contains("builtin cd"));
+        assert!(powershell.contains("function rift"));
+        assert!(powershell.contains("--shell-cwd @args"));
+        assert!(powershell.contains("Set-Location"));
+    }
+
+    #[test]
+    fn fish_and_powershell_quotes_escape_quotes() {
+        assert_eq!(fish_shell_quote("/tmp/it's rift"), "'/tmp/it\\'s rift'");
+        assert_eq!(
+            powershell_shell_quote("/tmp/it's rift"),
+            "'/tmp/it''s rift'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod diff_land_sync_tests {
+    use super::*;
+
+    #[test]
+    fn diff_land_and_sync_parse_flags() {
+        let diff = Cli::try_parse_from(["rift", "diff", "--json"]).unwrap();
+        let land = Cli::try_parse_from(["rift", "land", "/tmp/x"]).unwrap();
+        let sync = Cli::try_parse_from(["rift", "sync", "--json"]).unwrap();
+
+        assert!(matches!(diff.command, Command::Diff { json: true, .. }));
+        assert!(matches!(land.command, Command::Land { at: Some(_), .. }));
+        assert!(matches!(sync.command, Command::Sync { json: true, .. }));
     }
 }

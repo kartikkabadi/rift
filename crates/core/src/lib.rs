@@ -1,9 +1,12 @@
 mod config;
+pub mod cow_image;
+mod diff;
 mod filter;
 mod git;
 mod hook;
 mod id;
 mod marker;
+mod merge;
 mod name;
 mod registry;
 pub mod rpc;
@@ -76,7 +79,42 @@ pub enum Error {
         command: String,
         message: String,
     },
+    #[error("copy-on-write image setup failed: {0}")]
+    CowImageSetup(String),
+    #[error("workspace has no parent to {operation} with: {path}")]
+    NoParent {
+        path: PathBuf,
+        operation: &'static str,
+    },
+    /// `land`/`sync` reached a workspace inside a Git repository without
+    /// `files_only`: repository state belongs to Git and is never replayed
+    /// file-by-file.
+    #[error(
+        "{0} is a Git repository; land or sync it through Git, or pass filesOnly to merge working-tree files only"
+    )]
+    UseGit(PathBuf),
+    /// `land`/`sync` ran with `on_conflict: abort` and found conflicting
+    /// paths; nothing was written.
+    #[error(
+        "{operation} found {conflicts} conflicting path(s) in {path}; rerun with onConflict 'report' to apply clean paths or 'force' to take the incoming side"
+    )]
+    LandConflict {
+        operation: &'static str,
+        path: PathBuf,
+        conflicts: usize,
+    },
+    /// Another `create`, `land`, `sync`, or `remove` holds the root
+    /// workspace's lock.
+    #[error("{0} is locked by another rift operation")]
+    Locked(PathBuf),
+    /// A recorded base manifest cannot be decoded; the rift's merge base is
+    /// unknown, so landing it cannot be proven safe.
+    #[error("recorded base manifest is corrupt: {0}")]
+    CorruptBase(String),
 }
+
+pub use diff::{DiffEntry, DiffKind, TreeDiff};
+pub use merge::{ConflictEntry, LandOptions, LandOutcome, OnConflict};
 
 pub struct Create {
     pub from: PathBuf,
@@ -113,6 +151,7 @@ impl Create {
 pub struct CreateOptions {
     pub copy_mode: CopyMode,
     pub hook_mode: HookMode,
+    pub cow_mode: CowMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -133,6 +172,11 @@ impl CreateOptions {
         self
     }
 
+    pub fn cow_mode(mut self, cow_mode: CowMode) -> Self {
+        self.cow_mode = cow_mode;
+        self
+    }
+
     pub fn hook_mode(mut self, hook_mode: HookMode) -> Self {
         self.hook_mode = hook_mode;
         self
@@ -149,6 +193,44 @@ impl Default for CopyMode {
     fn default() -> Self {
         Self::Filtered
     }
+}
+
+/// Whether workspace creation may fall back to a regular full copy when the
+/// filesystem offers no copy-on-write mechanism.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CowMode {
+    /// Use copy-on-write when available, otherwise a regular copy.
+    #[default]
+    Auto,
+    /// Fail with `Error::CowUnavailable` instead of falling back.
+    Require,
+}
+
+/// The copy mechanism `create` will use for a workspace path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Writable btrfs subvolume snapshots.
+    Btrfs,
+    /// Native per-file reflinks on non-btrfs Linux filesystems.
+    Reflink,
+    /// APFS `clonefile`.
+    Apfs,
+    /// ReFS block cloning on Windows.
+    #[serde(rename = "refs")]
+    ReFs,
+    /// A regular file-by-file copy; works on every filesystem.
+    Portable,
+}
+
+/// The result of probing what a path supports.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Probe {
+    #[serde(serialize_with = "crate::diff::serialize_path")]
+    pub path: PathBuf,
+    pub backend: Backend,
+    /// The filesystem type name when the platform can report it.
+    pub filesystem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,16 +256,24 @@ pub enum InitProgress {
     RegisteringWorkspace,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InitOutcome {
     Registered,
     AlreadyInitialized,
     Converted,
+    /// Registered, but the filesystem offers no copy-on-write mechanism, so
+    /// new workspaces will be regular copies unless `CowMode::Require` is set.
+    Degraded,
 }
 
 impl InitOutcome {
     pub fn is_converted(self) -> bool {
         matches!(self, Self::Converted)
+    }
+
+    pub fn is_degraded(self) -> bool {
+        matches!(self, Self::Degraded)
     }
 }
 
@@ -206,6 +296,11 @@ impl Manager {
     }
 
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let registry = Registry::open(path)?;
         Ok(Self { registry, strategy })
     }
@@ -221,9 +316,25 @@ impl Manager {
     ) -> Result<PathBuf> {
         let requested = existing_directory(&input.from)?;
         let source = self.workspace_from(&requested)?;
-        let from = source.path.clone();
-        let git = git::check_source(&from)?;
+        let git = git::check_source(&source.path)?;
         let root = self.root(&source)?;
+        // The copy must not interleave with a `land`/`sync`/`remove`
+        // writing the same workspace family.
+        self.with_root_lock(&root, |this| {
+            this.create_locked(&source, &root, input, options, git)
+        })
+    }
+
+    /// The body of `create_with_options` once the family lock is held.
+    fn create_locked(
+        &mut self,
+        source: &Record,
+        root: &Record,
+        input: Create,
+        options: CreateOptions,
+        git: git::Source,
+    ) -> Result<PathBuf> {
+        let from = source.path.clone();
         let id = RiftId::new();
         let destination_parent = match input.into {
             Some(path) => absolute_path(&path)?,
@@ -269,9 +380,9 @@ impl Manager {
             &source.id,
         )?;
 
-        if let Err(error) = self
-            .strategy
-            .copy_directory(&from, &destination, options.copy_mode)
+        if let Err(error) =
+            self.strategy
+                .copy_directory(&from, &destination, options.copy_mode, options.cow_mode)
         {
             if !matches!(&error, Error::AlreadyExists(path) if path == &destination)
                 && destination.exists()
@@ -284,13 +395,29 @@ impl Manager {
         let result: Result<()> = (|| {
             marker::write(&destination, &id)?;
             if git.is_repository() {
+                #[cfg(windows)]
+                git::make_writable(&destination)?;
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
             }
             if git.is_repository() {
                 git::hide_marker(&from)?;
             }
-            self.registry.insert_child(&id, &source.id, &destination)?;
+            // The base is recorded in the same transaction as the rift row,
+            // so a rift can never exist without the manifest its `land` and
+            // `sync` merge against.
+            let base = merge::BaseManifest::record(
+                &from,
+                &destination,
+                options.copy_mode == CopyMode::Filtered,
+            )?;
+            self.registry.insert_child_with_base(
+                &id,
+                &source.id,
+                &destination,
+                &base.encode(),
+                git::head_commit(&destination).as_deref(),
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -310,12 +437,21 @@ impl Manager {
     }
 
     pub fn init(&mut self, at: impl AsRef<Path>) -> Result<InitOutcome> {
-        self.init_with_progress(at, |_| {})
+        self.init_with_cow_mode(at, CowMode::Auto, |_| {})
     }
 
     pub fn init_with_progress(
         &mut self,
         at: impl AsRef<Path>,
+        progress: impl FnMut(InitProgress),
+    ) -> Result<InitOutcome> {
+        self.init_with_cow_mode(at, CowMode::Auto, progress)
+    }
+
+    pub fn init_with_cow_mode(
+        &mut self,
+        at: impl AsRef<Path>,
+        cow_mode: CowMode,
         mut progress: impl FnMut(InitProgress),
     ) -> Result<InitOutcome> {
         let at = existing_directory(at.as_ref())?;
@@ -327,13 +463,16 @@ impl Manager {
             } else {
                 marker::verify(&record.path, &record.id)?;
             }
-            let converted = self.strategy.initialize_directory(&at, &mut progress)?;
+            let converted = self
+                .strategy
+                .initialize_directory(&at, &mut progress, cow_mode)?;
             if git.is_repository() {
                 git::hide_marker(&at)?;
             }
             return Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::AlreadyInitialized,
                 StrategyInit::Converted => InitOutcome::Converted,
+                StrategyInit::Degraded => InitOutcome::Degraded,
             });
         }
         if marker::read(&at)?.is_some() {
@@ -347,7 +486,9 @@ impl Manager {
             return Err(Error::OverlappingWorkspace(at));
         }
 
-        let converted = self.strategy.initialize_directory(&at, &mut progress)?;
+        let converted = self
+            .strategy
+            .initialize_directory(&at, &mut progress, cow_mode)?;
         progress(InitProgress::RegisteringWorkspace);
         let id = RiftId::new();
         let result = (|| {
@@ -359,6 +500,7 @@ impl Manager {
             Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::Registered,
                 StrategyInit::Converted => InitOutcome::Converted,
+                StrategyInit::Degraded => InitOutcome::Degraded,
             })
         })();
         if result.is_err() {
@@ -379,6 +521,12 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let config = self.remove_config(&record.path, options)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| this.remove_locked(&record, config))
+    }
+
+    /// The body of `remove_with_options` once the family lock is held.
+    fn remove_locked(&mut self, record: &Record, config: config::Config) -> Result<()> {
         let parent_id = record.parent_id.as_ref().unwrap_or(&record.id);
         hook::run(
             "preremove",
@@ -390,7 +538,7 @@ impl Manager {
             parent_id,
         )?;
         if record.parent_id.is_none() {
-            self.unregister_root(&record)?;
+            self.unregister_root(record)?;
             return hook::run(
                 "postremove",
                 config.postremove(),
@@ -429,6 +577,16 @@ impl Manager {
         let record = self.workspace_at(at)?;
         marker::verify(&record.path, &record.id)?;
         let config = self.remove_config(&record.path, options)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| this.remove_all_locked(&record, config))
+    }
+
+    /// The body of `remove_all_with_options` once the family lock is held.
+    fn remove_all_locked(
+        &mut self,
+        record: &Record,
+        config: config::Config,
+    ) -> Result<Vec<PathBuf>> {
         let parent_id = record.parent_id.as_ref().unwrap_or(&record.id);
         hook::run(
             "preremove",
@@ -607,14 +765,248 @@ impl Manager {
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>>>()?;
         self.registry.delete_active_records(&missing)?;
+
+        // A crash between the copy and the registry insert leaves an
+        // unregistered folder under the storage root; sweep it.
+        let mut swept = Vec::new();
+        for root in self.registry.root_paths()? {
+            // A held lock means another process is copying into this
+            // family right now; leave its half-written tree for the next
+            // pass.
+            if !self.registry.lock_root(&root.id)? {
+                continue;
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<Vec<PathBuf>> {
+                    let mut swept = Vec::new();
+                    if let Ok(storage) = default_storage(&root.path)
+                        && storage.is_dir()
+                    {
+                        for entry in fs::read_dir(&storage)? {
+                            let entry = entry?;
+                            let candidate = entry.path();
+                            let is_directory = entry
+                                .file_type()
+                                .map(|file_type| file_type.is_dir())
+                                .unwrap_or(false);
+                            // Internal folders (`.trash`, nested `.rifts`) belong
+                            // to rift itself, not to any registry row.
+                            if !is_directory
+                                || crate::diff::is_internal(Path::new(&entry.file_name()))
+                            {
+                                continue;
+                            }
+                            // Checked inside the lock, so a `create` that just
+                            // committed is never swept.
+                            if self.registry.record_at(&candidate)?.is_some() {
+                                continue;
+                            }
+                            self.strategy.remove_directory(&candidate)?;
+                            swept.push(candidate);
+                        }
+                    }
+                    // `.rift.tmp*` debris is invisible to diffs and git,
+                    // so nothing else ever removes it. The family lock is
+                    // held here, so every temp still on disk belongs to a
+                    // dead operation; the age bound covers the stale-lock
+                    // edge (a live apply's temp is never old).
+                    let cutoff = std::time::SystemTime::now() - TEMP_DEBRIS_MIN_AGE;
+                    for record in self
+                        .registry
+                        .subtree(&root.id, SubtreeScope::IncludingRoot)?
+                    {
+                        sweep_temp_debris(&record.path, cutoff, &mut swept);
+                    }
+                    Ok(swept)
+                },
+            ));
+            self.release_root(&root.id);
+            match result {
+                Ok(result) => swept.extend(result?),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
         Ok(removed
             .into_iter()
             .chain(missing.into_iter().map(|record| record.path))
+            .chain(swept)
             .collect())
     }
 
     pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(self.workspace_at(at)?.path)
+    }
+
+    /// The file-level changes inside the workspace at `at` relative to the
+    /// base it was copied from — exactly what `land` would apply. Paths the
+    /// copy filter excluded at creation are invisible. Rifts recorded before
+    /// base manifests existed fall back to a raw comparison with the parent.
+    pub fn diff(&self, at: impl AsRef<Path>) -> Result<TreeDiff> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "compare")?;
+        match self.base_manifest(&record.id)? {
+            Some(base) => {
+                let current = diff::manifest(&record.path, &|path| base.invisible(path))?;
+                Ok(TreeDiff {
+                    from: parent.path.clone(),
+                    to: record.path.clone(),
+                    entries: base.diff(&current),
+                })
+            }
+            None => diff::diff_trees(&parent.path, &record.path, &|_| false),
+        }
+    }
+
+    /// Applies the rift's changes into its parent workspace through a
+    /// three-way merge against the rift's recorded base. Changes the parent
+    /// made after the copy are preserved; paths both sides changed are
+    /// reported as conflicts. `.git` is never touched, and the whole
+    /// operation refuses a Git repository unless `files_only` is set.
+    pub fn land(&mut self, at: impl AsRef<Path>) -> Result<LandOutcome> {
+        self.land_with_options(at, LandOptions::default())
+    }
+
+    pub fn land_with_options(
+        &mut self,
+        at: impl AsRef<Path>,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "land")?;
+        marker::verify(&parent.path, &parent.id)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| {
+            this.merge_workspaces("land", &record, &parent.path, &record.path, options)
+        })
+    }
+
+    /// The reverse of `land`: merges the parent's changes into the rift
+    /// against the recorded base. Paths the rift changed are never
+    /// overwritten — they surface as conflicts instead.
+    pub fn sync(&mut self, at: impl AsRef<Path>) -> Result<LandOutcome> {
+        self.sync_with_options(at, LandOptions::default())
+    }
+
+    pub fn sync_with_options(
+        &mut self,
+        at: impl AsRef<Path>,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
+        let record = self.workspace_at(at)?;
+        marker::verify(&record.path, &record.id)?;
+        let parent = self.parent(&record, "sync")?;
+        marker::verify(&parent.path, &parent.id)?;
+        let root = self.root(&record)?;
+        self.with_root_lock(&root, |this| {
+            this.merge_workspaces("sync", &record, &record.path, &parent.path, options)
+        })
+    }
+
+    /// Runs the three-way merge writing `ours` (the parent for `land`, the
+    /// rift for `sync`) from `theirs`, then advances the rift's base.
+    fn merge_workspaces(
+        &mut self,
+        operation: &'static str,
+        record: &Record,
+        ours: &Path,
+        theirs: &Path,
+        options: LandOptions,
+    ) -> Result<LandOutcome> {
+        let ours_git = git::check_source(ours)?;
+        let theirs_git = git::check_source(theirs)?;
+        if !options.files_only && (ours_git.is_repository() || theirs_git.is_repository()) {
+            let repository = if ours_git.is_repository() {
+                ours
+            } else {
+                theirs
+            };
+            return Err(Error::UseGit(repository.to_path_buf()));
+        }
+
+        let base = self
+            .base_manifest(&record.id)?
+            .unwrap_or_else(merge::BaseManifest::empty);
+        let plan = merge::plan(&base, ours, theirs)?;
+        if options.on_conflict == OnConflict::Abort && !plan.conflicts.is_empty() {
+            return Err(Error::LandConflict {
+                operation,
+                path: ours.to_path_buf(),
+                conflicts: plan.conflicts.len(),
+            });
+        }
+
+        let mut next_slots = plan.next_slots;
+        let mut entries = plan.clean;
+        let mut conflicts = Vec::new();
+        let mut next_base = merge::BaseManifest {
+            filtered: base.filtered,
+            entries: plan.next_base,
+        };
+        for conflict in plan.conflicts {
+            if options.on_conflict == OnConflict::Force {
+                let forced = conflict.forced();
+                // On a folded volume a fold-twin write already absorbed
+                // the shared filesystem slot (the incoming half of a
+                // case-only rename); replaying the removal afterwards
+                // would delete the entry just written.
+                if forced.kind != DiffKind::Removed
+                    || !plan.absorbed_removals.contains(&forced.path)
+                {
+                    entries.push(forced);
+                }
+                merge::set_resolved(&mut next_base.entries, &conflict, next_slots.as_mut());
+            } else {
+                conflicts.push(conflict.entry);
+            }
+        }
+        if options.on_conflict == OnConflict::Force {
+            // These base rows were held only so a slot-level
+            // delete-vs-recase conflict stayed detectable; force settled
+            // every slot, so the rows advance with the rest of the base.
+            for path in plan.slot_pending {
+                next_base.entries.remove(&path);
+            }
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let applied = TreeDiff {
+            from: ours.to_path_buf(),
+            to: theirs.to_path_buf(),
+            entries,
+        };
+        diff::apply_diff(&applied)?;
+        self.registry.update_base(&record.id, &next_base.encode())?;
+        Ok(LandOutcome { applied, conflicts })
+    }
+
+    /// The recorded base manifest for a rift, decoded.
+    fn base_manifest(&self, id: &RiftId) -> Result<Option<merge::BaseManifest>> {
+        self.registry
+            .base_manifest(id)?
+            .map(|blob| merge::BaseManifest::decode(&blob))
+            .transpose()
+    }
+
+    fn parent(&self, record: &Record, operation: &'static str) -> Result<Record> {
+        let id = record.parent_id.clone().ok_or_else(|| Error::NoParent {
+            path: record.path.clone(),
+            operation,
+        })?;
+        self.registry
+            .record_id(&id)?
+            .ok_or_else(|| Error::NotManaged(record.path.clone()))
+    }
+
+    /// Reports which copy mechanism `create` would use for a path that exists
+    /// on disk, and the filesystem type name when the platform reports it.
+    pub fn probe(&self, at: impl AsRef<Path>) -> Result<Probe> {
+        let path = existing_directory(at.as_ref())?;
+        Ok(Probe {
+            backend: self.strategy.probe(&path)?,
+            filesystem: strategy::filesystem_name(&path),
+            path,
+        })
     }
 
     fn workspace_at(&self, path: impl AsRef<Path>) -> Result<Record> {
@@ -655,6 +1047,37 @@ impl Manager {
                 .ok_or_else(|| Error::NotManaged(record.path.clone()))?;
         }
         Ok(current)
+    }
+
+    /// Runs `f` holding the workspace family's merge lock. The lock is a
+    /// registry row, so file work happens outside any SQLite transaction,
+    /// and the row is released on every exit — Ok, Err, or unwinding —
+    /// because a panic must not leave a live-pid row that locks the
+    /// family for the rest of the process's lifetime.
+    fn with_root_lock<T>(
+        &mut self,
+        root: &Record,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if !self.registry.lock_root(&root.id)? {
+            return Err(Error::Locked(root.path.clone()));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.release_root(&root.id);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Best-effort lock release. A failed delete is never reported as the
+    /// operation's error — the work already happened — and the leftover
+    /// row is reclaimed once its pid dies. One immediate retry covers a
+    /// transient database error.
+    fn release_root(&mut self, root_id: &RiftId) {
+        if self.registry.unlock_root(root_id).is_err() {
+            let _ = self.registry.unlock_root(root_id);
+        }
     }
 }
 
@@ -703,6 +1126,48 @@ fn trash_path(id: &RiftId, path: &Path) -> Result<PathBuf> {
     Ok(parent
         .join(".trash")
         .join(format!("{id}-{}", name.to_string_lossy())))
+}
+
+/// How old a `.rift.tmp*` leftover must be before `gc` sweeps it: every
+/// legitimate temp is created, written, and renamed within seconds, so
+/// anything past an hour can only be crash debris.
+const TEMP_DEBRIS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Best-effort sweep of stale apply/marker temps inside `workspace`,
+/// called by `gc` with the family lock held. Only `is_temp_name` files
+/// older than `cutoff` go; directories are never removed (the generators
+/// only make files, so a temp-named directory is user content), and
+/// internal/copy-filtered subtrees are not descended. Failures are
+/// skipped rather than reported — debris cleanup must not fail `gc`.
+fn sweep_temp_debris(workspace: &Path, cutoff: std::time::SystemTime, swept: &mut Vec<PathBuf>) {
+    if !workspace.is_dir() {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(workspace)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            entry
+                .path()
+                .strip_prefix(workspace)
+                .is_ok_and(|path| !diff::is_internal(path) && !filter::CopyFilter.excludes(path))
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_dir() || !diff::is_temp_name(entry.file_name()) {
+            continue;
+        }
+        let stale = fs::symlink_metadata(entry.path())
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|mtime| mtime < cutoff);
+        if stale && fs::remove_file(entry.path()).is_ok() {
+            swept.push(entry.path().to_path_buf());
+        }
+    }
 }
 
 #[cfg(test)]

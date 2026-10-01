@@ -15,6 +15,9 @@ impl CopyFilter {
             .collect::<Vec<_>>();
 
         parts.iter().any(|part| excludes_component(part))
+            // `.rift.tmp*`: in-flight writes — the marker's atomic temp
+            // and `apply_diff`'s per-file copy temps; a crash leaves them.
+            || parts.iter().any(|part| crate::diff::is_temp_name(part))
             || parts.windows(2).any(|parts| {
                 matches_yarn_artifact(parts[0], parts[1])
                     || matches_git_artifact(parts[0], parts[1])
@@ -25,6 +28,11 @@ impl CopyFilter {
 fn excludes_component(part: &OsStr) -> bool {
     [
         "node_modules",
+        // Rift's own storage dirs: a workspace that holds another family's
+        // `.rifts`/`.trash`/`.rifts-images` must not copy them recursively.
+        ".rifts",
+        ".trash",
+        ".rifts-images",
         ".pnpm-store",
         "target",
         ".venv",
@@ -72,6 +80,9 @@ mod tests {
         assert!(filter.excludes(Path::new("packages/app/node_modules/react/index.js")));
         assert!(filter.excludes(Path::new("packages/app/.yarn/cache/react.zip")));
         assert!(filter.excludes(Path::new(".git/fsmonitor--daemon.ipc")));
+        assert!(filter.excludes(Path::new(".rifts/app/child/file.txt")));
+        assert!(filter.excludes(Path::new(".trash/abc-file.txt")));
+        assert!(filter.excludes(Path::new(".rifts-images/disk.img")));
         assert!(!filter.excludes(Path::new("packages/app/package-lock.json")));
     }
 }

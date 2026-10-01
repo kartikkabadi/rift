@@ -5,14 +5,14 @@ use super::reflink::{
     MetadataTarget, copy_metadata_linux, import_directory_linux, import_directory_linux_filtered,
 };
 use super::{Strategy, StrategyInit};
-use crate::{CopyMode, Error, InitProgress, Result};
+use crate::{Backend, CopyMode, CowMode, Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
 
 pub(super) struct BtrfsStrategy;
 
 impl Strategy for BtrfsStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, _cow: CowMode) -> Result<()> {
         copy_directory_linux(from, to, mode)
     }
 
@@ -20,12 +20,17 @@ impl Strategy for BtrfsStrategy {
         &self,
         path: &Path,
         progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         initialize_directory_linux(path, progress)
     }
 
     fn remove_directory(&self, path: &Path) -> Result<()> {
         remove_directory_linux(path)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Btrfs)
     }
 }
 
@@ -186,11 +191,11 @@ fn remove_emptyable_subvolume(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SNAP_CREATE: libc::c_ulong = 0x5000_9401;
+const BTRFS_IOC_SNAP_CREATE: libc::Ioctl = 0x5000_9401;
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
+const BTRFS_IOC_SUBVOL_CREATE: libc::Ioctl = 0x5000_940e;
 #[cfg(target_os = "linux")]
-const BTRFS_IOC_SNAP_DESTROY: libc::c_ulong = 0x5000_940f;
+const BTRFS_IOC_SNAP_DESTROY: libc::Ioctl = 0x5000_940f;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -202,7 +207,7 @@ struct BtrfsIoctlVolArgs {
 #[cfg(target_os = "linux")]
 fn btrfs_path_ioctl(
     path: &Path,
-    request: libc::c_ulong,
+    request: libc::Ioctl,
     source_fd: Option<libc::c_int>,
     action: &str,
 ) -> Result<()> {

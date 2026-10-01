@@ -33,6 +33,17 @@ fn create_options(copy_mode: CopyMode, hook_mode: HookMode) -> CreateOptions {
         .hook_mode(hook_mode)
 }
 
+// Hook scripts run through the platform shell; cmd's `echo` appends CRLF
+// (and keeps the space before `>>`), so compare logical lines.
+fn log_lines(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn child_path(source: &Path, name: &str) -> PathBuf {
     source.parent().unwrap().join(".rifts/app").join(name)
 }
@@ -292,14 +303,8 @@ run = "echo post >> lifecycle.log"
         .create(create_input(source.clone(), "lifecycle"))
         .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(source.join("lifecycle.log")).unwrap(),
-        "pre\n"
-    );
-    assert_eq!(
-        fs::read_to_string(child.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&source.join("lifecycle.log")), "pre");
+    assert_eq!(log_lines(&child.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
@@ -506,10 +511,7 @@ run = "echo post >> lifecycle.log"
     manager.remove(&child).unwrap();
 
     assert!(!child.exists());
-    assert_eq!(
-        fs::read_to_string(trash.join("lifecycle.log")).unwrap(),
-        "pre\npost\n"
-    );
+    assert_eq!(log_lines(&trash.join("lifecycle.log")), "pre\npost");
 }
 
 #[test]
@@ -609,7 +611,13 @@ struct InitializingStrategy {
 }
 
 impl Strategy for InitializingStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         unreachable!()
     }
 
@@ -617,9 +625,14 @@ impl Strategy for InitializingStrategy {
         &self,
         _path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
+        _cow: CowMode,
     ) -> Result<StrategyInit> {
         self.initialized.set(true);
         Ok(StrategyInit::Converted)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 
@@ -820,7 +833,13 @@ fn remove_rejects_overlapping_registered_paths_before_moving() {
     let source_id = marker_id(&source);
     manager
         .registry
-        .insert_child(&nested_id, &source_id, &nested)
+        .insert_child_with_base(
+            &nested_id,
+            &source_id,
+            &nested,
+            &crate::merge::BaseManifest::empty().encode(),
+            None,
+        )
         .unwrap();
 
     assert!(matches!(
@@ -892,6 +911,33 @@ fn gc_removes_trashed_entries() {
     assert!(deleted.contains(&first_trash));
     assert_eq!(deleted.len(), 2);
     assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[test]
+fn gc_sweeps_unregistered_folders_under_the_storage_root() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    // Crash debris: a copied tree that never reached the registry.
+    let storage = source.parent().unwrap().join(".rifts").join("app");
+    let orphan = storage.join("orphan");
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(orphan.join("leftover.txt"), "half copy").unwrap();
+    // A plain file in the storage root is not touched.
+    fs::write(storage.join("notes.txt"), "not a rift").unwrap();
+
+    let removed = manager.gc().unwrap();
+
+    assert_eq!(removed, vec![orphan.clone()]);
+    assert!(!orphan.exists());
+    assert!(storage.join("notes.txt").exists());
+    assert!(child.exists());
+    assert!(manager.list(&source).unwrap().contains(&child));
 }
 
 #[test]
@@ -1042,6 +1088,25 @@ fn git_copy_peels_symbolic_tag_heads_to_commits() {
 }
 
 #[test]
+fn diff_on_a_fresh_git_rift_is_clean() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    run(&source, &["init"]);
+    run(&source, &["config", "user.email", "test@example.com"]);
+    run(&source, &["config", "user.name", "Test"]);
+    run(&source, &["add", "file.txt"]);
+    run(&source, &["commit", "-m", "initial"]);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    // `create` detaches the rift's HEAD to a raw hash while the source keeps
+    // `ref: <branch>`; both resolve to the same commit, so the diff is clean.
+    let destination = manager.create(Create::new(source).named("git")).unwrap();
+
+    assert!(manager.diff(&destination).unwrap().is_clean());
+}
+
+#[test]
 fn create_requires_an_initialized_workspace() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
@@ -1115,21 +1180,35 @@ fn linked_git_directory_is_rejected_during_initialization() {
 struct PartialFailureStrategy;
 
 impl Strategy for PartialFailureStrategy {
-    fn copy_directory(&self, _from: &Path, to: &Path, _mode: CopyMode) -> Result<()> {
+    fn copy_directory(
+        &self,
+        _from: &Path,
+        to: &Path,
+        _mode: CopyMode,
+        _cow: CowMode,
+    ) -> Result<()> {
         fs::create_dir(to)?;
         fs::write(to.join("copied-before-failure.txt"), "partial")?;
         fs::create_dir(to.join("nested"))?;
         fs::write(to.join("nested/file.txt"), "partial")?;
         Err(Error::CowUnavailable("partial failure".into()))
     }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
+    }
 }
 
 struct CollisionStrategy;
 
 impl Strategy for CollisionStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode, cow: CowMode) -> Result<()> {
         fs::create_dir(to)?;
-        TestStrategy.copy_directory(from, to, mode)
+        TestStrategy.copy_directory(from, to, mode, cow)
+    }
+
+    fn probe(&self, _path: &Path) -> Result<Backend> {
+        Ok(Backend::Portable)
     }
 }
 
@@ -1286,4 +1365,485 @@ fn run(path: &Path, args: &[&str]) {
             .unwrap()
             .success()
     );
+}
+
+fn diff_kinds(diff: &TreeDiff) -> Vec<(String, DiffKind)> {
+    diff.entries
+        .iter()
+        .map(|entry| (entry.path.to_string_lossy().replace('\\', "/"), entry.kind))
+        .collect()
+}
+
+#[test]
+fn diff_reports_added_changed_and_removed_files() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let diff = manager.diff(&child).unwrap();
+
+    let kinds = diff_kinds(&diff);
+    assert!(kinds.contains(&("new.txt".into(), DiffKind::Added)));
+    assert!(kinds.contains(&("file.txt".into(), DiffKind::Changed)));
+    assert!(!kinds.iter().any(|(path, _)| path == ".rift"));
+}
+
+#[test]
+fn diff_reports_removals_and_directory_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/deep.txt"), "deep").unwrap();
+    fs::write(source.join("gone.txt"), "bye").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::remove_dir_all(child.join("nested")).unwrap();
+    fs::remove_file(child.join("gone.txt")).unwrap();
+
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+    assert!(kinds.contains(&("nested".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("nested/deep.txt".into(), DiffKind::Removed)));
+    assert!(kinds.contains(&("gone.txt".into(), DiffKind::Removed)));
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_reports_symlink_changes() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    std::os::unix::fs::symlink("file.txt", source.join("link.txt")).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    assert!(manager.diff(&child).unwrap().is_clean());
+
+    fs::remove_file(child.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("other.txt", child.join("link.txt")).unwrap();
+    let kinds = diff_kinds(&manager.diff(&child).unwrap());
+
+    assert!(kinds.contains(&("link.txt".into(), DiffKind::Changed)));
+
+    manager.land(&child).unwrap();
+    assert_eq!(
+        fs::read_link(source.join("link.txt")).unwrap(),
+        Path::new("other.txt")
+    );
+}
+
+#[test]
+fn land_applies_the_rifts_changes_to_the_source() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("old.txt"), "old").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(child.join("file.txt"), "edited").unwrap();
+    fs::write(child.join("new.txt"), "added").unwrap();
+    fs::remove_file(child.join("old.txt")).unwrap();
+    let outcome = manager.land(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "edited"
+    );
+    assert_eq!(fs::read_to_string(source.join("new.txt")).unwrap(), "added");
+    assert!(!source.join("old.txt").exists());
+    assert!(manager.diff(&child).unwrap().is_clean());
+    // The rift keeps working after landing.
+    assert_eq!(outcome.applied.entries.len(), 3);
+    assert!(marker::read(&child).unwrap().is_some());
+}
+
+#[test]
+fn sync_pulls_the_sources_changes_into_the_rift() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    fs::write(source.join("file.txt"), "upstream").unwrap();
+    fs::write(source.join("later.txt"), "new upstream file").unwrap();
+    let outcome = manager.sync(&child).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(child.join("file.txt")).unwrap(),
+        "upstream"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("later.txt")).unwrap(),
+        "new upstream file"
+    );
+    assert!(!outcome.applied.entries.is_empty());
+}
+
+#[test]
+fn root_workspace_has_no_parent_for_diff_land_or_sync() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    assert!(matches!(manager.diff(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.land(&source), Err(Error::NoParent { .. })));
+    assert!(matches!(manager.sync(&source), Err(Error::NoParent { .. })));
+}
+
+#[test]
+fn the_family_lock_is_released_when_the_operation_panics() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let root = manager.workspace_at(&source).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<()> = manager.with_root_lock(&root, |_| panic!("land exploded"));
+    }));
+    assert!(result.is_err());
+
+    // A panic must not leave a live-pid lock row: the family stays
+    // usable for the rest of the process's lifetime (the Bun FFI host
+    // catches the panic and keeps running).
+    assert!(manager.registry.lock_root(&root.id).unwrap());
+    manager.registry.unlock_root(&root.id).unwrap();
+}
+
+/// Whether the volume holding a workspace folds letter case: `.RIFT`
+/// resolves to the `.rift` marker only when it does. Mirrors the merge's
+/// own probe so expectations can skip on case-sensitive volumes.
+fn folds_case(workspace: &Path) -> bool {
+    workspace.join(".RIFT").exists()
+}
+
+/// Every `Present` path in a rift's persisted base manifest.
+fn persisted_present(manager: &Manager, id: &RiftId) -> Vec<PathBuf> {
+    let blob = manager.registry.base_manifest(id).unwrap().unwrap();
+    let base = merge::BaseManifest::decode(&blob).unwrap();
+    base.entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, merge::BaseEntry::Present(_)))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// The invariant a folding volume can never violate: two `Present` base
+/// rows must never fold to the same filesystem slot.
+fn assert_fold_unique(present: &[PathBuf]) {
+    let mut slots = std::collections::BTreeSet::new();
+    for path in present {
+        assert!(
+            slots.insert(path.to_string_lossy().to_lowercase()),
+            "doubled fold-slot base row: {present:?}"
+        );
+    }
+}
+
+/// A theirs-side recase settled by `land --on-conflict force` must leave
+/// exactly one `Present` base row for the fold slot. A stale second row
+/// makes the next recase-back read as a clean removal and silently
+/// deletes the file — and a later `sync` carries the phantom deletion
+/// into the rift too.
+#[test]
+fn force_settled_recase_never_doubles_the_base_slot() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+    let child_id = marker_id(&child);
+
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let present = persisted_present(&manager, &child_id);
+    assert_fold_unique(&present);
+    assert!(
+        present.contains(&PathBuf::from("Report.txt")),
+        "{present:?}"
+    );
+    assert!(
+        !present.contains(&PathBuf::from("report.txt")),
+        "{present:?}"
+    );
+
+    // Theirs recases back. The next land may hold a slot conflict, but
+    // the file must survive — silent deletion is the regression.
+    fs::rename(child.join("Report.txt"), child.join("report.txt")).unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+
+    // A sync must not propagate a phantom deletion into the rift.
+    manager.sync(&child).unwrap();
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert_eq!(fs::read_to_string(child.join("report.txt")).unwrap(), "v1");
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+}
+
+/// The phantom side of a doubled fold-slot base: with a stale `Present`
+/// row for the old casing, an ours-side edit reads as "theirs removed
+/// it", manufacturing a conflict theirs never made — and `force` then
+/// deletes the edited file for a removal that never happened.
+#[test]
+fn force_settled_recase_reports_no_phantom_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+    manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+
+    // Ours edits the settled file; theirs touched nothing, so no land
+    // may report a conflict — and forcing must not delete ours' edit.
+    fs::write(source.join("Report.txt"), "ours-edit").unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(
+        fs::read_to_string(source.join("Report.txt")).unwrap(),
+        "ours-edit"
+    );
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("Report.txt")).unwrap(),
+        "ours-edit"
+    );
+}
+
+/// The whole-tree form of the doubled fold-slot base: recasing a
+/// directory under force must leave one `Present` row per folded path,
+/// and the recase-back must hold conflicts instead of deleting the tree.
+#[test]
+fn force_settled_dir_recase_never_doubles_base_slots() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir_all(source.join("Docs/sub")).unwrap();
+    fs::write(source.join("Docs/note.txt"), "v1").unwrap();
+    fs::write(source.join("Docs/sub/deep.txt"), "v2").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+    let child_id = marker_id(&child);
+
+    fs::rename(child.join("Docs"), child.join("docs")).unwrap();
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let present = persisted_present(&manager, &child_id);
+    assert_fold_unique(&present);
+    assert_eq!(
+        fs::read_to_string(source.join("docs/sub/deep.txt")).unwrap(),
+        "v2"
+    );
+
+    // Theirs recases the tree back: conflicts may hold, but nothing under
+    // the slot may be deleted.
+    fs::rename(child.join("docs"), child.join("Docs")).unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Docs")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("docs/note.txt")).unwrap(),
+        "v1"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("docs/sub/deep.txt")).unwrap(),
+        "v2"
+    );
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+}
+
+/// A persisted base that already carries two `Present` rows for one fold
+/// slot (written by an older merge) must not make one conflict report
+/// twice in the same list.
+#[test]
+fn a_doubled_base_slot_reports_its_conflict_once() {
+    let temp = TempDir::new().unwrap();
+    let ours = temp.path().join("ours");
+    let theirs = temp.path().join("theirs");
+    fs::create_dir(&ours).unwrap();
+    fs::create_dir(&theirs).unwrap();
+    // The merge's fold probe keys off the marker resolving folded.
+    fs::write(ours.join(".rift"), "id\n").unwrap();
+    if !folds_case(&ours) {
+        return;
+    }
+    fs::write(ours.join("Report.txt"), "ours-edit").unwrap();
+
+    // The doubled fold-slot state an older merge could persist.
+    let entry = crate::diff::Entry {
+        kind: crate::diff::EntryKind::File,
+        mode: 0o644,
+        link_target: None,
+        hash: Some([0; 32]),
+    };
+    let base = merge::BaseManifest {
+        filtered: false,
+        entries: [
+            (
+                PathBuf::from("report.txt"),
+                merge::BaseEntry::Present(entry.clone()),
+            ),
+            (
+                PathBuf::from("Report.txt"),
+                merge::BaseEntry::Present(entry),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let plan = merge::plan(&base, &ours, &theirs).unwrap();
+    let paths: Vec<_> = plan
+        .conflicts
+        .iter()
+        .map(|conflict| conflict.entry.path.clone())
+        .collect();
+    let hits = paths
+        .iter()
+        .filter(|path| path.as_path() == Path::new("Report.txt"))
+        .count();
+    assert_eq!(hits, 1, "{paths:?}");
+}
+
+/// `gc` removes `.rift.tmp.*` crash debris — invisible to diffs and git,
+/// so nothing else ever cleans it — but only once it is old enough to be
+/// wreckage, never a live apply's in-flight temp.
+#[test]
+fn gc_sweeps_stale_apply_temps_and_keeps_fresh_ones() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    let stale = source.join(".rift.tmp.1.0.0123456789abcdef");
+    let stale_nested = source.join("sub/.rift.tmp.2.0.0123456789abcdef");
+    let stale_in_rift = child.join(".rift.tmp.3.0.0123456789abcdef");
+    let fresh = source.join(".rift.tmp.4.0.0123456789abcdef");
+    let lookalike = source.join(".rift.tmp.123.notes");
+    fs::create_dir(source.join("sub")).unwrap();
+    for path in [&stale, &stale_nested, &stale_in_rift, &fresh, &lookalike] {
+        fs::write(path, "partial").unwrap();
+    }
+    let old =
+        filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() - 2 * 3600, 0);
+    for path in [&stale, &stale_nested, &stale_in_rift, &lookalike] {
+        filetime::set_file_times(path, old, old).unwrap();
+    }
+
+    let removed = manager.gc().unwrap();
+
+    assert!(removed.contains(&stale));
+    assert!(removed.contains(&stale_nested));
+    assert!(removed.contains(&stale_in_rift));
+    assert!(!stale.exists());
+    assert!(!stale_nested.exists());
+    assert!(!stale_in_rift.exists());
+    // A temp young enough to belong to a live write, and a name that only
+    // shares the prefix, both survive.
+    assert!(fresh.exists());
+    assert!(lookalike.exists());
+}
+
+/// A family whose merge lock is held has a live operation somewhere: its
+/// temps — however old — are left for the next pass.
+#[test]
+fn gc_never_sweeps_temps_while_the_family_is_locked() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let root = manager.workspace_at(&source).unwrap();
+
+    let stale = source.join(".rift.tmp.1.0.0123456789abcdef");
+    fs::write(&stale, "partial").unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000, 0);
+    filetime::set_file_times(&stale, old, old).unwrap();
+
+    assert!(manager.registry.lock_root(&root.id).unwrap());
+    manager.gc().unwrap();
+    assert!(stale.exists());
+
+    manager.registry.unlock_root(&root.id).unwrap();
+    manager.gc().unwrap();
+    assert!(!stale.exists());
 }
