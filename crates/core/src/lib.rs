@@ -927,6 +927,7 @@ impl Manager {
             });
         }
 
+        let mut next_slots = plan.next_slots;
         let mut entries = plan.clean;
         let mut conflicts = Vec::new();
         let mut next_base = merge::BaseManifest {

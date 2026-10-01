@@ -1530,3 +1530,254 @@ fn the_family_lock_is_released_when_the_operation_panics() {
     assert!(manager.registry.lock_root(&root.id).unwrap());
     manager.registry.unlock_root(&root.id).unwrap();
 }
+
+/// Whether the volume holding a workspace folds letter case: `.RIFT`
+/// resolves to the `.rift` marker only when it does. Mirrors the merge's
+/// own probe so expectations can skip on case-sensitive volumes.
+fn folds_case(workspace: &Path) -> bool {
+    workspace.join(".RIFT").exists()
+}
+
+/// Every `Present` path in a rift's persisted base manifest.
+fn persisted_present(manager: &Manager, id: &RiftId) -> Vec<PathBuf> {
+    let blob = manager.registry.base_manifest(id).unwrap().unwrap();
+    let base = merge::BaseManifest::decode(&blob).unwrap();
+    base.entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, merge::BaseEntry::Present(_)))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// The invariant a folding volume can never violate: two `Present` base
+/// rows must never fold to the same filesystem slot.
+fn assert_fold_unique(present: &[PathBuf]) {
+    let mut slots = std::collections::BTreeSet::new();
+    for path in present {
+        assert!(
+            slots.insert(path.to_string_lossy().to_lowercase()),
+            "doubled fold-slot base row: {present:?}"
+        );
+    }
+}
+
+/// A theirs-side recase settled by `land --on-conflict force` must leave
+/// exactly one `Present` base row for the fold slot. A stale second row
+/// makes the next recase-back read as a clean removal and silently
+/// deletes the file — and a later `sync` carries the phantom deletion
+/// into the rift too.
+#[test]
+fn force_settled_recase_never_doubles_the_base_slot() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+    let child_id = marker_id(&child);
+
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let present = persisted_present(&manager, &child_id);
+    assert_fold_unique(&present);
+    assert!(
+        present.contains(&PathBuf::from("Report.txt")),
+        "{present:?}"
+    );
+    assert!(
+        !present.contains(&PathBuf::from("report.txt")),
+        "{present:?}"
+    );
+
+    // Theirs recases back. The next land may hold a slot conflict, but
+    // the file must survive — silent deletion is the regression.
+    fs::rename(child.join("Report.txt"), child.join("report.txt")).unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+
+    // A sync must not propagate a phantom deletion into the rift.
+    manager.sync(&child).unwrap();
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert_eq!(fs::read_to_string(child.join("report.txt")).unwrap(), "v1");
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+}
+
+/// The phantom side of a doubled fold-slot base: with a stale `Present`
+/// row for the old casing, an ours-side edit reads as "theirs removed
+/// it", manufacturing a conflict theirs never made — and `force` then
+/// deletes the edited file for a removal that never happened.
+#[test]
+fn force_settled_recase_reports_no_phantom_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+    manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+
+    // Ours edits the settled file; theirs touched nothing, so no land
+    // may report a conflict — and forcing must not delete ours' edit.
+    fs::write(source.join("Report.txt"), "ours-edit").unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert_eq!(
+        fs::read_to_string(source.join("Report.txt")).unwrap(),
+        "ours-edit"
+    );
+
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("Report.txt")).unwrap(),
+        "ours-edit"
+    );
+}
+
+/// The whole-tree form of the doubled fold-slot base: recasing a
+/// directory under force must leave one `Present` row per folded path,
+/// and the recase-back must hold conflicts instead of deleting the tree.
+#[test]
+fn force_settled_dir_recase_never_doubles_base_slots() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir_all(source.join("Docs/sub")).unwrap();
+    fs::write(source.join("Docs/note.txt"), "v1").unwrap();
+    fs::write(source.join("Docs/sub/deep.txt"), "v2").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+    let child_id = marker_id(&child);
+
+    fs::rename(child.join("Docs"), child.join("docs")).unwrap();
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    let present = persisted_present(&manager, &child_id);
+    assert_fold_unique(&present);
+    assert_eq!(
+        fs::read_to_string(source.join("docs/sub/deep.txt")).unwrap(),
+        "v2"
+    );
+
+    // Theirs recases the tree back: conflicts may hold, but nothing under
+    // the slot may be deleted.
+    fs::rename(child.join("docs"), child.join("Docs")).unwrap();
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Docs")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("docs/note.txt")).unwrap(),
+        "v1"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("docs/sub/deep.txt")).unwrap(),
+        "v2"
+    );
+    assert_fold_unique(&persisted_present(&manager, &child_id));
+}
+
+/// A persisted base that already carries two `Present` rows for one fold
+/// slot (written by an older merge) must not make one conflict report
+/// twice in the same list.
+#[test]
+fn a_doubled_base_slot_reports_its_conflict_once() {
+    let temp = TempDir::new().unwrap();
+    let ours = temp.path().join("ours");
+    let theirs = temp.path().join("theirs");
+    fs::create_dir(&ours).unwrap();
+    fs::create_dir(&theirs).unwrap();
+    // The merge's fold probe keys off the marker resolving folded.
+    fs::write(ours.join(".rift"), "id\n").unwrap();
+    if !folds_case(&ours) {
+        return;
+    }
+    fs::write(ours.join("Report.txt"), "ours-edit").unwrap();
+
+    // The doubled fold-slot state an older merge could persist.
+    let entry = crate::diff::Entry {
+        kind: crate::diff::EntryKind::File,
+        mode: 0o644,
+        link_target: None,
+        hash: Some([0; 32]),
+    };
+    let base = merge::BaseManifest {
+        filtered: false,
+        entries: [
+            (
+                PathBuf::from("report.txt"),
+                merge::BaseEntry::Present(entry.clone()),
+            ),
+            (
+                PathBuf::from("Report.txt"),
+                merge::BaseEntry::Present(entry),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let plan = merge::plan(&base, &ours, &theirs).unwrap();
+    let paths: Vec<_> = plan
+        .conflicts
+        .iter()
+        .map(|conflict| conflict.entry.path.clone())
+        .collect();
+    let hits = paths
+        .iter()
+        .filter(|path| path.as_path() == Path::new("Report.txt"))
+        .count();
+    assert_eq!(hits, 1, "{paths:?}");
+}

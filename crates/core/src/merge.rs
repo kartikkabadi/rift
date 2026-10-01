@@ -64,7 +64,9 @@ impl LandOptions {
 }
 
 /// A path both sides changed incompatibly. `ours`/`theirs` describe the
-/// change each side made relative to the base.
+/// change each side made relative to the base; on fold-slot conflicts
+/// the labels describe the slot's byte path, so e.g. `this: removed`
+/// can report a slot ours still holds under a different casing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConflictEntry {
     #[serde(serialize_with = "crate::diff::serialize_path")]
@@ -231,16 +233,26 @@ pub(crate) struct MergePlan {
     /// delete the entry just written, so a forced merge must skip them.
     /// See the case-fold pass at the end of [`plan`].
     pub(crate) absorbed_removals: BTreeSet<PathBuf>,
-    /// Converged removals whose base rows are held pending a fold-slot
-    /// conflict: both sides deleted the byte path, but a differently-cased
-    /// twin carries a delete-vs-recase conflict — dropping the row would
-    /// lose the delete intent before the conflict resolves. A merge that
+    /// Base rows held pending a fold-slot conflict: converged removals
+    /// whose differently-cased twin carries a delete-vs-recase conflict,
+    /// and removals pulled because their fold twin is being written —
+    /// dropping such a row would lose the delete intent before the
+    /// conflict resolves, while keeping it past a forced merge would
+    /// leave two `Present` rows for one filesystem slot. A merge that
     /// force-applies every conflict drops these rows since the slot's
     /// fate is then settled. See the case-fold logic inside [`plan`].
     pub(crate) slot_pending: BTreeSet<PathBuf>,
     /// Base entries after the clean paths land: conflicted paths keep
     /// their old values so the conflict stays visible to future merges.
     pub(crate) next_base: BTreeMap<PathBuf, BaseEntry>,
+    /// On a case-folding volume, the fold-slot index of `next_base`'s
+    /// `Present` rows, kept current through every insert so force
+    /// resolution can evict a stale same-slot row without rescanning the
+    /// base. Removals may leave stale entries; each can only name an
+    /// already-gone path, so evicting through it is always a safe no-op.
+    /// `None` on case-sensitive volumes, where byte names never share a
+    /// slot.
+    pub(crate) next_slots: Option<BTreeMap<Vec<u8>, PathBuf>>,
 }
 
 /// A conflict plus the entries needed to force-apply it.
@@ -263,9 +275,24 @@ impl PlannedConflict {
 /// Nothing is written; callers replay `plan.clean` (and force-applied
 /// conflicts) through `apply_diff`.
 pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) -> Result<MergePlan> {
+    let insensitive = volume_ignores_case(ours_root);
+    // `skip` consults only `Excluded` rows, which collapse never touches.
     let skip = |path: &Path| base.invisible(path);
     let ours = manifest(ours_root, &skip)?;
     let theirs = manifest(theirs_root, &skip)?;
+    let normalized;
+    let base = if insensitive {
+        // A base written by an older merge can carry two `Present` rows
+        // that fold to one filesystem slot — a state no real tree can
+        // produce, where the stale twin masks the live one and turns a
+        // later recase-back into a silent deletion. Collapse every
+        // doubled slot before planning so the merge — and the base it
+        // persists — starts from a state that can exist.
+        normalized = collapse_folded_base(base, &ours, &theirs);
+        &normalized
+    } else {
+        base
+    };
 
     let mut paths = BTreeSet::new();
     paths.extend(ours.keys().cloned());
@@ -280,6 +307,17 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     let mut clean = Vec::new();
     let mut conflicts = Vec::new();
     let mut next_base = base.entries.clone();
+    // `next_base`'s `Present` rows by fold slot. Every insert into
+    // `next_base` evicts a differently-cased same-slot row through this
+    // index — on a folding volume the persisted base can never hold two
+    // `Present` rows for one filesystem slot.
+    let mut next_slots = insensitive.then(|| {
+        next_base
+            .iter()
+            .filter(|(_, entry)| matches!(entry, BaseEntry::Present(_)))
+            .map(|(path, _)| (fold_key(path), path.clone()))
+            .collect::<BTreeMap<_, _>>()
+    });
     // What `ours` will look like at each visited path once the clean
     // entries apply: `true` means a real directory that can hold writes.
     // `paths` visits ancestors before their descendants, so a write can
@@ -296,7 +334,6 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     // a converged removal. Probed once per merge; on a folding volume
     // each side's manifest folds to slot keys so the merge can reason
     // about the slot rather than the byte path.
-    let insensitive = volume_ignores_case(ours_root);
     let folded_ours = insensitive.then(|| fold_map(&ours));
     let folded_theirs = insensitive.then(|| fold_map_multi(&theirs));
     let folded_base = insensitive.then(|| fold_base_map(base));
@@ -418,7 +455,7 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                         path.clone(),
                         t.is_some_and(|entry| entry.kind == EntryKind::Directory),
                     );
-                    set_base(&mut next_base, path, t);
+                    set_base(&mut next_base, path, t, next_slots.as_mut());
                 }
             }
             continue;
@@ -448,16 +485,20 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                     // Ours recased the slot's entry to `twin` while theirs
                     // deleted the slot entirely: delete-against-edit. The
                     // surviving ours-side name carries the conflict, and
-                    // forcing it applies theirs' deletion.
-                    conflicts.push(PlannedConflict {
-                        entry: ConflictEntry {
-                            path: twin.clone(),
-                            ours: side_change(b, ours.get(twin)),
-                            theirs: DiffKind::Removed,
-                        },
-                        theirs: None,
-                    });
-                    conflicted.insert(twin.clone());
+                    // forcing it applies theirs' deletion. `twin` may
+                    // already hold a conflict from its own path (only a
+                    // doubled fold-slot base can produce that) — a slot
+                    // must not report the same verdict twice.
+                    if conflicted.insert(twin.clone()) {
+                        conflicts.push(PlannedConflict {
+                            entry: ConflictEntry {
+                                path: twin.clone(),
+                                ours: side_change(b, ours.get(twin)),
+                                theirs: DiffKind::Removed,
+                            },
+                            theirs: None,
+                        });
+                    }
                 }
             }
             usable_dir.insert(
@@ -470,7 +511,7 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                 // delete intent stays detectable to the next merge.
                 slot_pending.insert(path.clone());
             } else {
-                set_base(&mut next_base, path, t);
+                set_base(&mut next_base, path, t, next_slots.as_mut());
             }
             continue;
         }
@@ -512,12 +553,18 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         clean.retain(|entry| {
             if entry.kind == DiffKind::Removed && twin_is_incoming(&entry.path) {
                 // Not applied and not a separate conflict: the fold-twin's
-                // collision already reports the pair. The base row stays
-                // so the held-back half remains visible to later merges.
+                // collision already reports the pair. The base row is
+                // held through `slot_pending` like any disputed slot:
+                // report mode keeps it so the held half stays visible,
+                // while a forced merge settles the slot and drops it —
+                // otherwise the kept row and the twin's resolved write
+                // would persist two `Present` rows for one slot.
+                slot_pending.insert(entry.path.clone());
                 set_base(
                     &mut next_base,
                     entry.path.clone(),
                     base.base_entry(&entry.path),
+                    next_slots.as_mut(),
                 );
                 return false;
             }
@@ -539,7 +586,7 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
             if conflict_keys.contains(&fold_key(path)) {
                 true
             } else {
-                set_base(&mut next_base, path.clone(), None);
+                set_base(&mut next_base, path.clone(), None, next_slots.as_mut());
                 false
             }
         });
@@ -552,6 +599,7 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         absorbed_removals,
         slot_pending,
         next_base,
+        next_slots,
     })
 }
 
@@ -697,21 +745,79 @@ fn planned(
 pub(crate) fn set_resolved(
     next_base: &mut BTreeMap<PathBuf, BaseEntry>,
     conflict: &PlannedConflict,
+    slots: Option<&mut BTreeMap<Vec<u8>, PathBuf>>,
 ) {
     set_base(
         next_base,
         conflict.entry.path.clone(),
         conflict.theirs.as_ref(),
+        slots,
     );
 }
 
 /// Records the merged state of a resolved path: the incoming side's entry,
-/// or nothing when that side deleted it.
-fn set_base(next_base: &mut BTreeMap<PathBuf, BaseEntry>, path: PathBuf, theirs: Option<&Entry>) {
+/// or nothing when that side deleted it. On a case-folding volume the
+/// fold-slot index `slots` tracks which `Present` row `next_base` holds
+/// per slot: an inserted row settles the whole slot, so a row recorded
+/// under a different casing of the same name is stale and drops with it
+/// — a persisted base may never hold two `Present` rows for one slot.
+fn set_base(
+    next_base: &mut BTreeMap<PathBuf, BaseEntry>,
+    path: PathBuf,
+    theirs: Option<&Entry>,
+    slots: Option<&mut BTreeMap<Vec<u8>, PathBuf>>,
+) {
     match theirs {
-        Some(entry) => next_base.insert(path, BaseEntry::Present(entry.clone())),
-        None => next_base.remove(&path),
-    };
+        Some(entry) => {
+            if let Some(slots) = slots
+                && let Some(twin) = slots.insert(fold_key(&path), path.clone())
+                && twin != path
+            {
+                next_base.remove(&twin);
+            }
+            next_base.insert(path, BaseEntry::Present(entry.clone()));
+        }
+        None => {
+            next_base.remove(&path);
+        }
+    }
+}
+
+/// Collapses `Present` rows that share a fold key — a doubled slot state
+/// no filesystem can produce — down to the row the trees actually hold:
+/// the name `ours` has on disk wins, otherwise a row theirs does *not*
+/// hold keeps the delete intent alive (an incoming write at the held
+/// casing still reads as delete-vs-recase), otherwise the first name
+/// stands. `Excluded` rows are invisible markers, never slot claims, so
+/// they pass through untouched.
+fn collapse_folded_base(
+    base: &BaseManifest,
+    ours: &BTreeMap<PathBuf, Entry>,
+    theirs: &BTreeMap<PathBuf, Entry>,
+) -> BaseManifest {
+    let mut slots: BTreeMap<Vec<u8>, Vec<&Path>> = BTreeMap::new();
+    for (path, entry) in &base.entries {
+        if matches!(entry, BaseEntry::Present(_)) {
+            slots.entry(fold_key(path)).or_default().push(path);
+        }
+    }
+    let mut entries = base.entries.clone();
+    for group in slots.values().filter(|group| group.len() > 1) {
+        let survivor = group
+            .iter()
+            .find(|path| ours.contains_key(**path))
+            .or_else(|| group.iter().find(|path| !theirs.contains_key(**path)))
+            .or_else(|| group.first());
+        for path in group {
+            if Some(*path) != survivor.copied() {
+                entries.remove(*path);
+            }
+        }
+    }
+    BaseManifest {
+        filtered: base.filtered,
+        entries,
+    }
 }
 
 /// `ours` changed something under directory `path` since the base when a
