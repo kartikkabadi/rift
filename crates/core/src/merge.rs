@@ -231,6 +231,13 @@ pub(crate) struct MergePlan {
     /// delete the entry just written, so a forced merge must skip them.
     /// See the case-fold pass at the end of [`plan`].
     pub(crate) absorbed_removals: BTreeSet<PathBuf>,
+    /// Converged removals whose base rows are held pending a fold-slot
+    /// conflict: both sides deleted the byte path, but a differently-cased
+    /// twin carries a delete-vs-recase conflict — dropping the row would
+    /// lose the delete intent before the conflict resolves. A merge that
+    /// force-applies every conflict drops these rows since the slot's
+    /// fate is then settled. See the case-fold logic inside [`plan`].
+    pub(crate) slot_pending: BTreeSet<PathBuf>,
     /// Base entries after the clean paths land: conflicted paths keep
     /// their old values so the conflict stays visible to future merges.
     pub(crate) next_base: BTreeMap<PathBuf, BaseEntry>,
@@ -284,23 +291,42 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     let mut conflicted: BTreeSet<PathBuf> = BTreeSet::new();
     // On a case-insensitive volume two byte-distinct names are one
     // directory slot: writing `Report.txt` over `report.txt` is a silent
-    // overwrite, not an add. Probed once and folded maps built lazily, so
-    // clean merges pay nothing for the check.
-    let mut insensitive: Option<bool> = None;
-    let mut folded_ours: Option<BTreeMap<Vec<u8>, PathBuf>> = None;
-    let mut folded_theirs: Option<BTreeMap<Vec<u8>, Vec<PathBuf>>> = None;
-    let mut name_collides = |path: &Path| {
-        if !*insensitive.get_or_insert_with(|| volume_ignores_case(ours_root)) {
+    // overwrite, not an add — and deleting `report.txt` while the other
+    // side only recased it to `Report.txt` is a delete-against-edit, not
+    // a converged removal. Probed once per merge; on a folding volume
+    // each side's manifest folds to slot keys so the merge can reason
+    // about the slot rather than the byte path.
+    let insensitive = volume_ignores_case(ours_root);
+    let folded_ours = insensitive.then(|| fold_map(&ours));
+    let folded_theirs = insensitive.then(|| fold_map_multi(&theirs));
+    let folded_base = insensitive.then(|| fold_base_map(base));
+    let name_collides = |path: &Path| {
+        let (Some(folded_ours), Some(folded_theirs)) = (&folded_ours, &folded_theirs) else {
             return false;
-        }
-        let folded_ours = folded_ours.get_or_insert_with(|| fold_map(&ours));
-        let folded_theirs = folded_theirs.get_or_insert_with(|| fold_map_multi(&theirs));
+        };
         let key = fold_key(path);
         folded_ours
             .get(&key)
             .is_some_and(|other| other.as_path() != path)
             || folded_theirs.get(&key).is_some_and(|twins| twins.len() > 1)
     };
+    // The differently-cased base twin both sides dropped: an incoming
+    // write at `path` then resurrects the entry `ours` deleted under a
+    // new casing — a delete-against-edit on the slot, not a clean add.
+    // When `theirs` still holds the base twin the write is an unrelated
+    // add landing on a slot `ours` freed, which both intents survive.
+    let deleted_base_twin = |path: &Path| -> Option<PathBuf> {
+        folded_base
+            .as_ref()?
+            .get(&fold_key(path))
+            .filter(|twin| {
+                twin.as_path() != path
+                    && !ours.contains_key(twin.as_path())
+                    && !theirs.contains_key(twin.as_path())
+            })
+            .cloned()
+    };
+    let mut slot_pending = BTreeSet::new();
     for path in paths {
         let b = base.base_entry(&path);
         let o = ours.get(&path);
@@ -332,6 +358,13 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                 usable_dir.insert(path, false);
                 continue;
             }
+            // A base twin ours deleted: this write would resurrect a
+            // filesystem slot ours meant gone — delete-against-edit, not
+            // a clean add. Checked after the container gate so a broken
+            // chain still escalates the ancestors force must restore.
+            let deleted_twin = (kind != DiffKind::Removed)
+                .then(|| deleted_base_twin(&path))
+                .flatten();
             match t {
                 Some(entry) if !entry.is_supported() => {
                     conflicts.push(planned(path.clone(), b, o, t));
@@ -363,6 +396,19 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
                     conflicted.insert(path.clone());
                     usable_dir.insert(path, false);
                 }
+                _ if let Some(twin) = deleted_twin => {
+                    // Labels come from the slot's own state (the deleted
+                    // twin), so the report reads `this: removed` for the
+                    // side that deleted it.
+                    conflicts.push(planned(
+                        path.clone(),
+                        base.base_entry(&twin),
+                        ours.get(&twin),
+                        t,
+                    ));
+                    conflicted.insert(path.clone());
+                    usable_dir.insert(path, false);
+                }
                 _ => {
                     clean.push(DiffEntry {
                         path: path.clone(),
@@ -379,11 +425,53 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         }
         if o == t {
             // Both sides ended up identical: converged without a write.
+            // On a case-folding volume a converged *removal* can still
+            // hide a slot-level delete-vs-modify: one side moved the
+            // slot's entry to a differently-cased name while the other
+            // deleted it outright.
+            let mut slot_changed = false;
+            if o.is_none() && b.is_some() && insensitive {
+                let key = fold_key(&path);
+                let changed = |side: &BTreeMap<PathBuf, Entry>, twin: &Path| {
+                    twin != path && side.get(twin) != base.base_entry(twin)
+                };
+                let ours_twin = folded_ours
+                    .as_ref()
+                    .and_then(|map| map.get(&key))
+                    .filter(|twin| changed(&ours, twin.as_path()));
+                let theirs_twin = folded_theirs
+                    .as_ref()
+                    .and_then(|map| map.get(&key))
+                    .and_then(|twins| twins.iter().find(|twin| changed(&theirs, twin.as_path())));
+                slot_changed = ours_twin.is_some() || theirs_twin.is_some();
+                if let (Some(twin), None) = (ours_twin, theirs_twin) {
+                    // Ours recased the slot's entry to `twin` while theirs
+                    // deleted the slot entirely: delete-against-edit. The
+                    // surviving ours-side name carries the conflict, and
+                    // forcing it applies theirs' deletion.
+                    conflicts.push(PlannedConflict {
+                        entry: ConflictEntry {
+                            path: twin.clone(),
+                            ours: side_change(b, ours.get(twin)),
+                            theirs: DiffKind::Removed,
+                        },
+                        theirs: None,
+                    });
+                    conflicted.insert(twin.clone());
+                }
+            }
             usable_dir.insert(
                 path.clone(),
                 o.is_some_and(|entry| entry.kind == EntryKind::Directory),
             );
-            set_base(&mut next_base, path, t);
+            if slot_changed {
+                // The byte path converged as deleted, but a fold-twin
+                // still disputes the slot — keep the base row so the
+                // delete intent stays detectable to the next merge.
+                slot_pending.insert(path.clone());
+            } else {
+                set_base(&mut next_base, path, t);
+            }
             continue;
         }
         // A conflicted path may still be force-applied, so a broken
@@ -412,8 +500,8 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
     // removal must be skipped, because replaying it afterwards would
     // delete the entry just written.
     let mut absorbed_removals = BTreeSet::new();
-    if insensitive.unwrap_or(false) {
-        let folded_theirs = folded_theirs.get_or_insert_with(|| fold_map_multi(&theirs));
+    if insensitive {
+        let folded_theirs = folded_theirs.as_ref().unwrap();
         let twin_is_incoming = |path: &Path| {
             folded_theirs.get(&fold_key(path)).is_some_and(|twins| {
                 twins
@@ -440,6 +528,21 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
             .filter(|conflict| conflict.theirs.is_none() && twin_is_incoming(&conflict.entry.path))
             .map(|conflict| conflict.entry.path.clone())
             .collect();
+        // A held converged removal whose slot produced no conflict was a
+        // false alarm — both sides recased to the same name — so the
+        // deletion still advances the base after all.
+        let conflict_keys: BTreeSet<Vec<u8>> = conflicts
+            .iter()
+            .map(|conflict| fold_key(&conflict.entry.path))
+            .collect();
+        slot_pending.retain(|path| {
+            if conflict_keys.contains(&fold_key(path)) {
+                true
+            } else {
+                set_base(&mut next_base, path.clone(), None);
+                false
+            }
+        });
     }
     clean.sort_by(|a, b| a.path.cmp(&b.path));
     conflicts.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
@@ -447,6 +550,7 @@ pub(crate) fn plan(base: &BaseManifest, ours_root: &Path, theirs_root: &Path) ->
         clean,
         conflicts,
         absorbed_removals,
+        slot_pending,
         next_base,
     })
 }
@@ -515,6 +619,17 @@ fn fold_map_multi(manifest: &BTreeMap<PathBuf, Entry>) -> BTreeMap<Vec<u8>, Vec<
         map.entry(fold_key(path)).or_default().push(path.clone());
     }
     map
+}
+
+/// The base manifest's `Present` paths folded to slot keys, so the merge
+/// can tell that `ours` deleted the differently-cased twin of an incoming
+/// write — the byte path is absent from `ours`, but its slot was changed.
+fn fold_base_map(base: &BaseManifest) -> BTreeMap<Vec<u8>, PathBuf> {
+    base.entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, BaseEntry::Present(_)))
+        .map(|(path, _)| (fold_key(path), path.clone()))
+        .collect()
 }
 
 /// Whether the volume holding `root` ignores letter case: `.RIFT` only

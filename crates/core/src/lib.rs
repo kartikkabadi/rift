@@ -950,6 +950,14 @@ impl Manager {
                 conflicts.push(conflict.entry);
             }
         }
+        if options.on_conflict == OnConflict::Force {
+            // These base rows were held only so a slot-level
+            // delete-vs-recase conflict stayed detectable; force settled
+            // every slot, so the rows advance with the rest of the base.
+            for path in plan.slot_pending {
+                next_base.entries.remove(&path);
+            }
+        }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         let applied = TreeDiff {
             from: ours.to_path_buf(),

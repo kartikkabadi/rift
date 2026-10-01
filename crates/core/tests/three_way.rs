@@ -1027,3 +1027,311 @@ fn long_file_names_land_without_wedging() {
     assert!(retry.applied.is_clean());
     assert!(retry.conflicts.is_empty());
 }
+
+/// Ours deletes a file while theirs only recases it: on a case-folding
+/// volume both byte names are one filesystem slot, so that is
+/// delete-against-edit, not a clean add under a new name.
+#[test]
+fn delete_versus_recase_reports_a_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::remove_file(source.join("report.txt")).unwrap();
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    if !folds_case(&source) {
+        // Byte-distinct names on a case-sensitive volume: the delete
+        // converges with theirs' removal and the add lands cleanly.
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+        return;
+    }
+
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    // The delete-vs-modify was held: theirs' recased file must not
+    // silently resurrect the slot ours deleted.
+    assert!(!source.join("report.txt").exists());
+    assert!(!source.join("Report.txt").exists());
+
+    // The conflict stays reported until resolved rather than converging.
+    let retry = manager.land(&child).unwrap();
+    assert!(
+        retry
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        retry.conflicts
+    );
+
+    // Forcing takes the incoming side: theirs' recased file lands.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+/// The directory form of `delete_versus_recase_reports_a_conflict`:
+/// theirs recases a whole tree ours deleted — the incoming paths under
+/// the shared slot are conflicts, not a silent resurrection.
+#[test]
+fn delete_versus_recased_tree_reports_conflicts() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("Docs")).unwrap();
+    fs::write(source.join("Docs/note.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::remove_dir_all(source.join("Docs")).unwrap();
+    fs::rename(child.join("Docs"), child.join("docs")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("docs")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("docs/note.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!source.join("Docs").exists());
+    assert!(!source.join("docs").exists());
+
+    // Forcing restores theirs' recased tree.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("docs/note.txt")).unwrap(),
+        "v1"
+    );
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+/// The mirror direction: ours recases while theirs deletes. Nothing may
+/// apply silently — the surviving ours-side name carries the conflict,
+/// and forcing honors theirs' deletion of the slot.
+#[test]
+fn recase_versus_delete_reports_a_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::rename(source.join("report.txt"), source.join("Report.txt")).unwrap();
+    fs::remove_file(child.join("report.txt")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    // Ours' recased file was not silently deleted — it stays put while
+    // the conflict is reported.
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+
+    let retry = manager.land(&child).unwrap();
+    assert!(
+        retry
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        retry.conflicts
+    );
+
+    // Forcing takes theirs' deletion: the slot empties out.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert!(!source.join("Report.txt").exists());
+    assert!(!source.join("report.txt").exists());
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+/// Both sides recasing to the same name is the same change: it converges
+/// with no conflict — the fold slot logic must not fire on it.
+#[test]
+fn identical_recases_converge_without_a_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::rename(source.join("report.txt"), source.join("Report.txt")).unwrap();
+    fs::rename(child.join("report.txt"), child.join("Report.txt")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    assert!(outcome.applied.is_clean(), "{:?}", outcome.applied.entries);
+    assert_eq!(fs::read_to_string(source.join("Report.txt")).unwrap(), "v1");
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+/// The sync direction holds the same promise: the rift deleting a path
+/// the parent only recased is a conflict, not a silent resurrection.
+#[test]
+fn sync_delete_versus_recase_reports_a_conflict() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("report.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::remove_file(child.join("report.txt")).unwrap();
+    fs::rename(source.join("report.txt"), source.join("Report.txt")).unwrap();
+
+    let outcome = manager.sync(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("Report.txt")),
+        "{:?}",
+        outcome.conflicts
+    );
+    assert!(!child.join("report.txt").exists());
+    assert!(!child.join("Report.txt").exists());
+}
+
+/// Direction-2 with a tree: ours recases a directory while theirs
+/// deletes it — the recased tree is ours' change, so each path under
+/// the shared slot conflicts instead of silently surviving or dying.
+#[test]
+fn recased_tree_versus_delete_reports_conflicts() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::create_dir(source.join("Docs")).unwrap();
+    fs::write(source.join("Docs/note.txt"), "v1").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+    if !folds_case(&source) {
+        return;
+    }
+
+    fs::rename(source.join("Docs"), source.join("docs")).unwrap();
+    fs::remove_dir_all(child.join("Docs")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == Path::new("docs")),
+        "{:?}",
+        outcome.conflicts
+    );
+    // Ours' recased tree is untouched while the conflict reports.
+    assert_eq!(
+        fs::read_to_string(source.join("docs/note.txt")).unwrap(),
+        "v1"
+    );
+
+    // Forcing honors theirs' deletion: the whole slot empties.
+    let forced = manager
+        .land_with_options(
+            &child,
+            LandOptions::default().on_conflict(OnConflict::Force),
+        )
+        .unwrap();
+    assert!(forced.conflicts.is_empty());
+    assert!(!source.join("Docs").exists());
+    assert!(!source.join("docs").exists());
+    assert!(manager.diff(&child).unwrap().is_clean());
+}
+
+/// On a folded volume `mv b A` where `a` exists silently overwrites `a`
+/// — the names share one slot — so ours deleting `a` while theirs ran
+/// that rename is still delete-against-edit on the slot, spelled
+/// whichever case the filesystem kept. On a case-sensitive volume the
+/// names are unrelated paths and the merge is clean.
+#[test]
+fn rename_over_a_deleted_folded_twin_conflicts() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    fs::write(source.join("a"), "a").unwrap();
+    fs::write(source.join("b"), "b").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager.create(Create::new(&source)).unwrap();
+
+    fs::remove_file(source.join("a")).unwrap();
+    fs::rename(child.join("b"), child.join("A")).unwrap();
+
+    let outcome = manager.land(&child).unwrap();
+    if !folds_case(&source) {
+        assert!(outcome.conflicts.is_empty());
+        assert!(!source.join("a").exists());
+        assert_eq!(fs::read_to_string(source.join("A")).unwrap(), "b");
+        return;
+    }
+
+    assert!(
+        outcome
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path.to_string_lossy().eq_ignore_ascii_case("a")),
+        "{:?}",
+        outcome.conflicts
+    );
+    // The slot ours deleted was not silently resurrected.
+    assert!(!source.join("a").exists());
+    assert!(!source.join("A").exists());
+}
