@@ -117,75 +117,17 @@ pub(crate) fn diff_trees(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool) -
 pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
     let mut directories = BTreeSet::new();
     for entry in &diff.entries {
-        let source = diff.to.join(&entry.path);
-        let destination = diff.from.join(&entry.path);
-        if entry.kind == DiffKind::Removed {
-            // The plan exempts removals from the container check because an
-            // earlier entry can make them vacuous mid-apply: a directory
-            // this same apply replaced by a symlink would resolve the
-            // removal outside the workspace. Skip it rather than error or
-            // delete through the link.
-            if symlinked_ancestor(&diff.from, &destination)?.is_none() {
-                remove_path(&destination)?;
-            }
-            continue;
-        }
-        // The merge plan already refuses writes under a container `ours`
-        // broke; this check is the enforcement at the write boundary so a
-        // symlinked directory inside the destination can never redirect an
-        // entry outside the workspace root.
-        check_container_chain(&diff.from, &destination)?;
-        let metadata = fs::symlink_metadata(&source)?;
-        let file_type = metadata.file_type();
-        let existing = fs::symlink_metadata(&destination)
-            .ok()
-            .map(|metadata| metadata.file_type());
-        let same_kind = existing.is_some_and(|existing| {
-            (existing.is_dir() && file_type.is_dir())
-                || (existing.is_file() && file_type.is_file())
-                || (existing.is_symlink() && file_type.is_symlink())
-        });
-        if !same_kind {
-            remove_path(&destination)?;
-        }
-        if file_type.is_dir() {
-            if existing.is_none() || !same_kind {
-                fs::create_dir(&destination)?;
-            } else {
-                // The destination may resolve through case folding to an
-                // entry stored under a different case — the surviving half
-                // of a case-only rename. Take the incoming side's name so
-                // the pair applies as a rename rather than a no-op.
-                rename_folded_twin(&destination)?;
-            }
-            directories.insert(destination.clone());
-        } else if file_type.is_file() {
-            // Overwriting a read-only destination (common under `.git`)
-            // fails on Windows, so clear the bit first.
-            if let Ok(existing) = fs::symlink_metadata(&destination) {
-                let mut permissions = existing.permissions();
-                if permissions.readonly() {
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    permissions.set_readonly(false);
-                    fs::set_permissions(&destination, permissions)?;
-                }
-            }
-            copy_file(&source, &destination)?;
-            // Renaming over a folded sibling replaces the entry but keeps
-            // the stored case (APFS); take the incoming side's exact name.
-            rename_folded_twin(&destination)?;
-        } else if file_type.is_symlink() {
-            if existing.is_some() {
-                remove_path(&destination)?;
-            }
-            portable::create_symlink(&source, &destination)?;
-            portable::copy_metadata(&source, &destination, portable::MetadataTarget::Symlink)?;
-        } else {
-            return Err(Error::UnsupportedEntry(source));
-        }
-        if let Some(parent) = destination.parent() {
-            directories.insert(parent.to_path_buf());
-        }
+        apply_entry(diff, entry, &mut directories).map_err(|error| match error {
+            // Attach the entry being applied: a bare io error such as
+            // `os error 63` gives the caller nothing to find the failed
+            // path with.
+            Error::Io(source) => Error::IoAt {
+                operation: "apply",
+                path: entry.path.clone(),
+                source,
+            },
+            error => error,
+        })?;
     }
     // Update directory metadata once their contents are settled, deepest
     // first so parent timestamps are written last.
@@ -202,6 +144,87 @@ pub(crate) fn apply_diff(diff: &TreeDiff) -> Result<()> {
                 portable::MetadataTarget::FileOrDirectory,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Replays one diff entry at `entry.path`: added and changed entries are
+/// copied from `diff.to`; removed ones are deleted from `diff.from`.
+/// `directories` collects the destinations whose metadata is refreshed
+/// once every entry has settled.
+fn apply_entry(
+    diff: &TreeDiff,
+    entry: &DiffEntry,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let source = diff.to.join(&entry.path);
+    let destination = diff.from.join(&entry.path);
+    if entry.kind == DiffKind::Removed {
+        // The plan exempts removals from the container check because an
+        // earlier entry can make them vacuous mid-apply: a directory
+        // this same apply replaced by a symlink would resolve the
+        // removal outside the workspace. Skip it rather than error or
+        // delete through the link.
+        if symlinked_ancestor(&diff.from, &destination)?.is_none() {
+            remove_path(&destination)?;
+        }
+        return Ok(());
+    }
+    // The merge plan already refuses writes under a container `ours`
+    // broke; this check is the enforcement at the write boundary so a
+    // symlinked directory inside the destination can never redirect an
+    // entry outside the workspace root.
+    check_container_chain(&diff.from, &destination)?;
+    let metadata = fs::symlink_metadata(&source)?;
+    let file_type = metadata.file_type();
+    let existing = fs::symlink_metadata(&destination)
+        .ok()
+        .map(|metadata| metadata.file_type());
+    let same_kind = existing.is_some_and(|existing| {
+        (existing.is_dir() && file_type.is_dir())
+            || (existing.is_file() && file_type.is_file())
+            || (existing.is_symlink() && file_type.is_symlink())
+    });
+    if !same_kind {
+        remove_path(&destination)?;
+    }
+    if file_type.is_dir() {
+        if existing.is_none() || !same_kind {
+            fs::create_dir(&destination)?;
+        } else {
+            // The destination may resolve through case folding to an
+            // entry stored under a different case — the surviving half
+            // of a case-only rename. Take the incoming side's name so
+            // the pair applies as a rename rather than a no-op.
+            rename_folded_twin(&destination)?;
+        }
+        directories.insert(destination.clone());
+    } else if file_type.is_file() {
+        // Overwriting a read-only destination (common under `.git`)
+        // fails on Windows, so clear the bit first.
+        if let Ok(existing) = fs::symlink_metadata(&destination) {
+            let mut permissions = existing.permissions();
+            if permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                fs::set_permissions(&destination, permissions)?;
+            }
+        }
+        copy_file(&source, &destination)?;
+        // Renaming over a folded sibling replaces the entry but keeps
+        // the stored case (APFS); take the incoming side's exact name.
+        rename_folded_twin(&destination)?;
+    } else if file_type.is_symlink() {
+        if existing.is_some() {
+            remove_path(&destination)?;
+        }
+        portable::create_symlink(&source, &destination)?;
+        portable::copy_metadata(&source, &destination, portable::MetadataTarget::Symlink)?;
+    } else {
+        return Err(Error::UnsupportedEntry(source));
+    }
+    if let Some(parent) = destination.parent() {
+        directories.insert(parent.to_path_buf());
     }
     Ok(())
 }
@@ -280,22 +303,19 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// is namespaced to rift and unguessable (pid, sequence, random), and it
 /// is opened with `create_new`: a planted file or symlink fails the
 /// attempt instead of being silently overwritten and renamed over the
-/// destination.
+/// destination. The destination's own name is deliberately left out —
+/// pid+seq+random already disambiguate, and appending a near-NAME_MAX
+/// filename would overflow the temp's own name and wedge the apply.
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| Error::Path(format!("path has no parent: {}", destination.display())))?;
-    let name = destination
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
     for _ in 0..3 {
         let temporary = parent.join(format!(
-            ".rift.tmp.{}.{}.{:016x}.{}",
+            ".rift.tmp.{}.{}.{:016x}",
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
-            rand::random::<u64>(),
-            name
+            rand::random::<u64>()
         ));
         let written = fs::OpenOptions::new()
             .write(true)
@@ -417,10 +437,16 @@ impl Entry {
 }
 
 /// Whether a name is a rift-internal temp file: the marker's in-flight
-/// write `.rift.tmp`, or an `apply_diff` copy temp `.rift.tmp.<pid>.…`
-/// (`copy_file` names them `.rift.tmp.<pid>.<seq>.<random>.<name>`).
-/// Anything else that merely shares the `.rift.tmp` prefix is ordinary
-/// user content and stays visible to manifests and merges.
+/// write `.rift.tmp`, or an `apply_diff` copy temp. `copy_file` names
+/// temps `.rift.tmp.<pid>.<seq>.<16-hex-rand>`; an older shape appended
+/// the destination name (`…<rand>.<name>`) and a dirty tree can still
+/// carry it, so both field counts are recognized. Anything else sharing
+/// the prefix is ordinary user content and stays visible to manifests
+/// and merges. Residual ambiguity: a user file named exactly like a
+/// generated temp (pid, seq, 16-hex field) is indistinguishable from
+/// real debris and stays hidden — while the oldest `.rift.tmp.<pid>.
+/// <name>` form (two fields, no random) collides with plausible user
+/// names like `.rift.tmp.123.notes` and is therefore content.
 pub(crate) fn is_temp_name(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     if bytes == b".rift.tmp" {
@@ -429,11 +455,15 @@ pub(crate) fn is_temp_name(name: &OsStr) -> bool {
     let Some(rest) = bytes.strip_prefix(b".rift.tmp.") else {
         return false;
     };
-    let mut fields = rest.splitn(2, |byte| *byte == b'.');
+    let digits = |field: &[u8]| !field.is_empty() && field.iter().all(|b| b.is_ascii_digit());
+    let mut fields = rest.split(|byte| *byte == b'.');
     let pid = fields.next().unwrap_or_default();
-    !pid.is_empty()
-        && pid.iter().all(|byte| byte.is_ascii_digit())
-        && fields.next().is_some_and(|field| !field.is_empty())
+    let seq = fields.next().unwrap_or_default();
+    let random = fields.next().unwrap_or_default();
+    digits(pid)
+        && digits(seq)
+        && random.len() == 16
+        && random.iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Path components that never participate in diffs or lands: git internals
@@ -540,4 +570,66 @@ fn mode(metadata: &fs::Metadata) -> u32 {
 #[cfg(not(any(unix, windows)))]
 fn mode(metadata: &fs::Metadata) -> u32 {
     u32::from(metadata.permissions().readonly())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn temp_names_match_only_the_generated_shapes() {
+        // The marker's in-flight write.
+        assert!(is_temp_name(OsStr::new(".rift.tmp")));
+        // The current apply-temp shape: pid + sequence + 16-hex random.
+        assert!(is_temp_name(OsStr::new(
+            ".rift.tmp.1234.7.01668a6f4dfb0a56"
+        )));
+        // The previous shape appended the destination name; debris from a
+        // dirty tree written by that build must still be recognized.
+        assert!(is_temp_name(OsStr::new(
+            ".rift.tmp.1234.7.01668a6f4dfb0a56.big.bin"
+        )));
+        assert!(is_temp_name(OsStr::new(
+            ".rift.tmp.1.0.0000000000000000.a.b.c"
+        )));
+        // Lookalikes are user content, not debris — including pid-led
+        // names missing the sequence/random fields.
+        for name in [
+            ".rift.tmp.keep",
+            ".rift.tmp.d",
+            ".rift.tmp.456",
+            ".rift.tmp.123.notes",
+            ".rift.tmp.9.partial",
+            ".rift.tmp.1.x.01668a6f4dfb0a56",
+            ".rift.tmp.x.2.01668a6f4dfb0a56",
+            ".rift.tmp.1.2.tooshort",
+            ".rift.tmp.1.2.01668a6f4dfb0a56EXTRA",
+            ".rift.tmp..2.01668a6f4dfb0a56",
+            ".rift.tmp.1.2.",
+            ".rift.tmpx",
+            ".rift.tmpx.1.2.01668a6f4dfb0a56",
+            "notes.rift.tmp.1.2.01668a6f4dfb0a56",
+        ] {
+            assert!(!is_temp_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn apply_errors_carry_the_entry_path() {
+        let from = TempDir::new().unwrap();
+        let to = TempDir::new().unwrap();
+        let diff = TreeDiff {
+            from: from.path().to_path_buf(),
+            to: to.path().to_path_buf(),
+            entries: vec![DiffEntry {
+                path: PathBuf::from("missing/nested.txt"),
+                kind: DiffKind::Added,
+            }],
+        };
+        // A bare `os error 2` gives the RPC caller nothing to locate the
+        // failing entry with; the error must name the entry's path.
+        let error = apply_diff(&diff).unwrap_err();
+        assert!(error.to_string().contains("missing/nested.txt"), "{error}");
+    }
 }

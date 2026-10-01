@@ -56,23 +56,28 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
     };
-    // `/.rift` anchors the root marker; `.rift.tmp*` hides the temp files
-    // interrupted atomic writes can leave behind, at any depth.
-    if existing
+    // `/.rift` anchors the root marker; `.rift.tmp` and the fielded
+    // `.rift.tmp.*.*.*` glob hide the temp names `is_temp_name` produces,
+    // at any depth. Git's glob cannot check the field contents, so a user
+    // file like `.rift.tmp.a.b.c` is still hidden here while rift counts
+    // it as content — a deliberate one-sided divergence narrower than the
+    // old `.rift.tmp*` glob, which also hid real user files.
+    let mut lines = existing
         .lines()
-        .any(|line| line.trim_end_matches(' ') == "/.rift")
-    {
+        .filter(|line| line.trim_end_matches(' ') != ".rift.tmp*")
+        .collect::<Vec<_>>();
+    for wanted in ["/.rift", ".rift.tmp", ".rift.tmp.*.*.*"] {
+        if !lines
+            .iter()
+            .any(|line| line.trim_end_matches(' ') == wanted)
+        {
+            lines.push(wanted);
+        }
+    }
+    if lines == existing.lines().collect::<Vec<_>>() {
         return Ok(());
     }
-    let separator = if existing.is_empty() || existing.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    fs::write(
-        exclude,
-        format!("{existing}{separator}/.rift\n.rift.tmp*\n"),
-    )?;
+    fs::write(exclude, format!("{}\n", lines.join("\n")))?;
     Ok(())
 }
 
@@ -192,24 +197,37 @@ mod tests {
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "/.rift\n.rift.tmp*\n"
+            "/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), "existing").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n.rift.tmp*\n"
+            "existing\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            "existing\n/.rift\n.rift.tmp*\n"
+            "existing\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
         fs::write(temp.path().join(".git/info/exclude"), " /.rift\n").unwrap();
         hide_marker(temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
-            " /.rift\n/.rift\n.rift.tmp*\n"
+            " /.rift\n/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
+        );
+        // A workspace an older build hid its temps behind the broad
+        // `.rift.tmp*` glob is narrowed to the shapes rift produces —
+        // user files that merely share the prefix are git-visible again.
+        fs::write(
+            temp.path().join(".git/info/exclude"),
+            "/.rift\n.rift.tmp*\n",
+        )
+        .unwrap();
+        hide_marker(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
+            "/.rift\n.rift.tmp\n.rift.tmp.*.*.*\n"
         );
     }
 
